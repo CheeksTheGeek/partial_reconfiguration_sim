@@ -1,0 +1,65 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Build output
+build
+
+# Example dependencies
+/examples/deps
+
+# Common editor/IDE config and temporary files
+.project
+.vscode/
+.sw[a-p]
+tags
+*~
+.DS_Store
+compile_flags.txt
+
+# binary outputs
+*.bin
+*.elf
+*.hex
+*.so
+*.o
+*.d
+*.vpi
+*.vvp
+*.out
+*.dSYM
+*.swp
+
+# other outputs
+*.log
+*.egg-info
+*.doit*
+*.vcd
+*.fst
+*.fst.hier
+results.xml
+obj_dir
+.pytest_cache
+*.mt0
+*.wrapper*
+
+# queues
+queue-*
+*.q
+
+# Python cache files
+__pycache__
+.venv/
+
+# act secrets
+.secrets
+
+# i like it like this
+uv.lock

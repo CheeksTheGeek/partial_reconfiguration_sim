@@ -1,0 +1,66 @@
+version: "1.0"
+
+simulation:
+  tool: verilator
+  trace: false
+  trace_type: fst
+  build_dir: build
+
+static_region:
+  name: top
+  design: top
+  sources:
+    - rtl/top.sv
+    - rtl/top_counter.sv
+  clock: clock
+  auto_wrap: true
+  auto_wrap_config:
+    clock_name: clock
+    enable_read_back: true
+
+partitions:
+  - name: pr_partition
+    rm_module: blinking_led
+    clock: clock
+
+    boundary:
+      - name: counter
+        direction: to_rm
+        width: 32
+      - name: led_two_on
+        direction: from_rm
+        width: 1
+      - name: led_three_on
+        direction: from_rm
+        width: 1
+
+    initial_rm: blinking_led
+
+reconfigurable_modules:
+  - name: blinking_led
+    partition: pr_partition
+    design: blinking_led
+    sources:
+      - rtl/blinking_led.sv
+    auto_wrap: true
+    auto_wrap_config:
+      clock_name: clock
+      enable_read_back: true
+
+  - name: blinking_led_slow
+    partition: pr_partition
+    design: blinking_led_slow
+    sources:
+      - rtl/blinking_led_slow.sv
+    auto_wrap: true
+    auto_wrap_config:
+      clock_name: clock
+
+  - name: blinking_led_empty
+    partition: pr_partition
+    design: blinking_led_empty
+    sources:
+      - rtl/blinking_led_empty.sv
+    auto_wrap: true
+    auto_wrap_config:
+      clock_name: clock

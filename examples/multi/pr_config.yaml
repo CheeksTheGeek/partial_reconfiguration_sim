@@ -1,0 +1,94 @@
+version: "1.0"
+
+simulation:
+  tool: verilator
+  trace: false
+  trace_type: fst
+  build_dir: build
+
+static_region:
+  name: static_region
+  design: static_region
+  sources:
+    - rtl/static_region.sv
+  clock: clk
+  auto_wrap: true
+  auto_wrap_config:
+    clock_name: clk
+    enable_read_back: true
+
+partitions:
+  - name: rp0
+    rm_module: counter_rm
+    clock: clk
+    boundary:
+      - name: counter
+        direction: from_rm
+        width: 32
+    initial_rm: counter_rm
+
+  - name: rp1
+    rm_module: adder_rm
+    clock: clk
+    boundary:
+      - name: operand_a
+        direction: to_rm
+        width: 32
+      - name: operand_b
+        direction: to_rm
+        width: 32
+      - name: result
+        direction: from_rm
+        width: 32
+    initial_rm: adder_rm
+
+reconfigurable_modules:
+  - name: counter_rm
+    partition: rp0
+    design: counter_rm
+    sources: [rtl/counter_rm.sv]
+    auto_wrap: true
+    auto_wrap_config:
+      clock_name: clk
+      enable_read_back: true
+
+  - name: passthrough_rm
+    partition: rp0
+    design: passthrough_rm
+    sources: [rtl/passthrough_rm.sv]
+    auto_wrap: true
+    auto_wrap_config:
+      clock_name: clk
+
+  - name: adder_rm
+    partition: rp1
+    design: adder_rm
+    sources: [rtl/adder_rm.sv]
+    auto_wrap: true
+    auto_wrap_config:
+      clock_name: clk
+      enable_read_back: true
+
+  - name: subtractor_rm
+    partition: rp1
+    design: subtractor_rm
+    sources: [rtl/subtractor_rm.sv]
+    auto_wrap: true
+    auto_wrap_config:
+      clock_name: clk
+
+  - name: xor_cipher_rm
+    partition: rp1
+    design: xor_cipher_rm
+    sources: [rtl/xor_cipher_rm.sv]
+    auto_wrap: true
+    auto_wrap_config:
+      clock_name: clk
+
+  - name: sub_cipher_rm
+    partition: rp1
+    design: sub_cipher_rm
+    sources: [rtl/sub_cipher_rm.sv]
+    auto_wrap: true
+    auto_wrap_config:
+      clock_name: clk

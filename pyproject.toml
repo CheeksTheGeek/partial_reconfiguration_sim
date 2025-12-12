@@ -1,0 +1,29 @@
+[project]
+name = "partial-reconfiguration"
+version = "0.1.0"
+description = "FPGA Partial Reconfiguration simulation framework built on Switchboard"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "switchboard-hw >= 0.3.0",
+    "siliconcompiler >= 0.35.3, < 0.36.0",
+    "pyslang >= 7.0.0",
+    "numpy",
+    "pyyaml",
+    "umi>=0.3.1",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest >=8,<10",
+]
+
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["partial_reconfiguration"]
+
+[tool.setuptools.package-data]
+"*" = ["*.sv", "*.v", "*.vh", "*.svh"]
