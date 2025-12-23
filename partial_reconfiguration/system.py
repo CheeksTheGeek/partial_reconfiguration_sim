@@ -11,6 +11,7 @@ from .timing import ConfigurationTimingModel, ConfigInterface
 from .static import StaticRegion
 from .reconfiguration import ResetBehavior
 from .exceptions import PRConfigError, PRValidationError, PRReconfigurationError, PRBuildError
+from .barrier import CycleBarrier
 
 from switchboard.util import ProcessCollection
 
@@ -51,7 +52,8 @@ class PRSystem:
         cmdline: bool = False,
         build_dir: str = None,
         config_timing: bool = False,
-        require_static_region: bool = True
+        require_static_region: bool = True,
+        cycle_accurate: bool = False
     ):
         """
         Initialize PR simulation system.
@@ -83,6 +85,11 @@ class PRSystem:
         require_static_region : bool
             If True (default), validation will fail without a static region.
             Set to False only for testing standalone RMs.
+        cycle_accurate : bool
+            Enable cycle-accurate simulation mode.
+            When True, uses barrier synchronization to ensure all processes
+            (static region + RMs) advance cycle-by-cycle together.
+            WARNING: This is extremely slow (barrier per cycle).
         """
         self.config: Optional[PRConfig] = None
         self.tool = tool
@@ -93,6 +100,7 @@ class PRSystem:
         self.start_delay = start_delay
         self.build_dir = build_dir or 'build/pr'
         self.require_static_region = require_static_region
+        self.cycle_accurate = cycle_accurate
         self._static_region: Optional[StaticRegion] = None
         self.partitions: Dict[str, Partition] = {}
         self.modules: Dict[str, ReconfigurableModule] = {}
@@ -102,6 +110,8 @@ class PRSystem:
         self._built = False
         self._running = False
         self._validated = False
+        self._barrier: Optional[CycleBarrier] = None
+        self._barrier_uri: Optional[str] = None
         self._greybox_generator = GreyboxGenerator(
             build_dir=f"{self.build_dir}/greybox"
         )
@@ -595,15 +605,47 @@ class PRSystem:
         """
         if not self._built:
             self.build()
-        if self._static_region is not None:
-            proc = self._static_region.start(start_delay=start_delay or self.start_delay)
-            self.process_collection.add(proc)
-            logger.info("Static region started - will keep running during RM swaps")
         if initial_rms is None:
             initial_rms = {}
         for part_name, partition in self.partitions.items():
             if part_name not in initial_rms and partition.initial_rm_name:
                 initial_rms[part_name] = partition.initial_rm_name
+        barrier_plusargs = []
+        if self.cycle_accurate:
+            num_procs = (1 if self._static_region is not None else 0) + len(initial_rms)
+            if num_procs < 2:
+                logger.warning(
+                    "cycle_accurate=True but fewer than 2 processes - "
+                    "barrier sync requires static region + at least one RM"
+                )
+            else:
+                barrier_dir = Path(self.build_dir) / 'barrier'
+                barrier_dir.mkdir(parents=True, exist_ok=True)
+                self._barrier_uri = str(barrier_dir / 'cycle_barrier.sync')
+
+                self._barrier = CycleBarrier(
+                    uri=self._barrier_uri,
+                    create=True,
+                    num_processes=num_procs
+                )
+                logger.info(
+                    f"Created cycle barrier for {num_procs} processes: {self._barrier_uri}"
+                )
+
+        if self._static_region is not None:
+            if self.cycle_accurate and self._barrier is not None:
+                barrier_plusargs = [
+                    f'barrier_uri={self._barrier_uri}',
+                    'barrier_leader=0',
+                    f'barrier_procs={self._barrier.get_num_processes()}'
+                ]
+            proc = self._static_region.start(
+                start_delay=start_delay or self.start_delay,
+                extra_plusargs=barrier_plusargs
+            )
+            self.process_collection.add(proc)
+            logger.info("Static region started - will keep running during RM swaps")
+
         for partition_name, rm_name in initial_rms.items():
             if partition_name not in self.partitions:
                 raise PRReconfigurationError(
@@ -616,7 +658,15 @@ class PRSystem:
 
             partition = self.partitions[partition_name]
             rm = self.modules[rm_name]
-            partition.load_rm(rm)
+            rm_barrier_plusargs = []
+            if self.cycle_accurate and self._barrier is not None:
+                rm_barrier_plusargs = [
+                    f'barrier_uri={self._barrier_uri}',
+                    'barrier_leader=0',
+                    f'barrier_procs={self._barrier.get_num_processes()}'
+                ]
+
+            partition.load_rm(rm, extra_plusargs=rm_barrier_plusargs)
 
         self._running = True
         return self.process_collection
@@ -1046,6 +1096,12 @@ class PRSystem:
         if self._static_region is not None:
             self._static_region.terminate(timeout=timeout)
         self.process_collection.terminate(stop_timeout=timeout)
+
+        # Close barrier if present
+        if self._barrier is not None:
+            self._barrier.close()
+            self._barrier = None
+            self._barrier_uri = None
 
         self._running = False
         logger.info("All simulations terminated")

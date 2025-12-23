@@ -42,6 +42,25 @@ partitions:
         width: 32
     initial_rm: adder_rm
 
+  # Echo partition for cycle accuracy testing
+  - name: rp_echo
+    rm_module: echo_counter_rm
+    clock: clk
+    boundary:
+      - name: static_counter_in
+        direction: to_rm
+        width: 32
+      - name: rm_counter
+        direction: from_rm
+        width: 32
+      - name: static_counter_echo
+        direction: from_rm
+        width: 32
+      - name: latency_measurement
+        direction: from_rm
+        width: 32
+    initial_rm: echo_counter_rm
+
 reconfigurable_modules:
   - name: counter_rm
     partition: rp0
@@ -92,3 +111,13 @@ reconfigurable_modules:
     auto_wrap: true
     auto_wrap_config:
       clock_name: clk
+
+  # Echo counter RM for cycle accuracy testing
+  - name: echo_counter_rm
+    partition: rp_echo
+    design: echo_counter_rm
+    sources: [rtl/echo_counter_rm.sv]
+    auto_wrap: true
+    auto_wrap_config:
+      clock_name: clk
+      enable_read_back: true

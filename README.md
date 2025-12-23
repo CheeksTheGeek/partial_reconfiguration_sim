@@ -3,6 +3,10 @@
 Read `examples/{multi|blinking_led}/test.py` and then run:
 
 ```console
+uv pip install git+https://github.com/CheeksTheGeek/switchboard # custom switchboard fork to allow barrier syncing
+```
+
+```console
 uv run examples/blinking_led/test.py
 ```
 

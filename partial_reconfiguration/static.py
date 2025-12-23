@@ -232,6 +232,10 @@ class StaticRegion:
             }
             logger.info(f"Added UMI interfaces for auto-wrapped static region: dw={umi_dw}, aw={umi_aw}, cw={umi_cw}")
 
+        cycle_sync = False
+        if self.system and hasattr(self.system, 'cycle_accurate'):
+            cycle_sync = self.system.cycle_accurate
+
         self._dut = SbDut(
             design=design_obj,
             tool=tool,
@@ -244,7 +248,8 @@ class StaticRegion:
             interfaces=interfaces,
             clocks=self.clocks,
             resets=self.resets,
-            builddir=self.build_dir
+            builddir=self.build_dir,
+            cycle_sync=cycle_sync
         )
 
         return self._dut
@@ -501,7 +506,11 @@ class StaticRegion:
             return self._wrapper_output.address_map
         return None
 
-    def start(self, start_delay: float = None) -> subprocess.Popen:
+    def start(
+        self,
+        start_delay: float = None,
+        extra_plusargs: List[str] = None
+    ) -> subprocess.Popen:
         """
         Start the static region simulation.
 
@@ -513,6 +522,9 @@ class StaticRegion:
         ----------
         start_delay : float, optional
             Delay before starting
+        extra_plusargs : list, optional
+            Additional plusargs to pass to the simulator.
+            Used for barrier synchronization in cycle-accurate mode.
 
         Returns
         -------
@@ -527,6 +539,7 @@ class StaticRegion:
         try:
             self._process = dut.simulate(
                 start_delay=start_delay,
+                plusargs=extra_plusargs or [],
                 intf_objs=True  # Static region owns interface objects
             )
             self._running = True

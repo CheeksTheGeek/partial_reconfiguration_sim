@@ -197,7 +197,11 @@ class Partition:
 
         return self._greybox_rm
 
-    def load_rm(self, rm: 'ReconfigurableModule') -> bool:
+    def load_rm(
+        self,
+        rm: 'ReconfigurableModule',
+        extra_plusargs: List[str] = None
+    ) -> bool:
         """
         Load an RM into this partition.
 
@@ -207,6 +211,9 @@ class Partition:
         ----------
         rm : ReconfigurableModule
             RM to load
+        extra_plusargs : list, optional
+            Additional plusargs to pass to the simulator.
+            Used for barrier synchronization in cycle-accurate mode.
 
         Returns
         -------
@@ -228,7 +235,7 @@ class Partition:
 
         rm.configure_queues(self._queue_uris)
 
-        rm.start()
+        rm.start(extra_plusargs=extra_plusargs)
 
         self.active_rm = rm
         return True

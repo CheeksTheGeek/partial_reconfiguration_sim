@@ -209,6 +209,10 @@ class ReconfigurableModule:
             trace_type = self.system.trace_type
             frequency = self.system.frequency
             max_rate = self.system.max_rate
+        cycle_sync = False
+        if self.system and hasattr(self.system, 'cycle_accurate'):
+            cycle_sync = self.system.cycle_accurate
+
         self._dut = SbDut(
             design=design_obj,
             tool=tool,
@@ -222,7 +226,8 @@ class ReconfigurableModule:
             clocks=self.clocks,
             resets=self.resets,
             tieoffs=self.tieoffs,
-            builddir=self._get_build_dir()
+            builddir=self._get_build_dir(),
+            cycle_sync=cycle_sync
         )
 
         return self._dut
@@ -774,7 +779,7 @@ class ReconfigurableModule:
                 if rm_port in self._dut.intf_defs:
                     self._dut.intf_defs[rm_port]['uri'] = uri
 
-    def start(self) -> subprocess.Popen:
+    def start(self, extra_plusargs: List[str] = None) -> subprocess.Popen:
         """
         Start the RM simulation process.
 
@@ -783,6 +788,12 @@ class ReconfigurableModule:
 
         Note: Python interface objects are NOT created here - they are
         owned by the Partition and persist across RM swaps.
+
+        Parameters
+        ----------
+        extra_plusargs : list, optional
+            Additional plusargs to pass to the simulator.
+            Used for barrier synchronization in cycle-accurate mode.
 
         Returns
         -------
@@ -813,7 +824,10 @@ class ReconfigurableModule:
                 plusargs.append((wire, uri))
         logger.info(f"[{self.name}] Expected plusargs: {plusargs}")
         try:
-            self._process = dut.simulate(intf_objs=False)
+            self._process = dut.simulate(
+                plusargs=extra_plusargs or [],
+                intf_objs=False
+            )
         except Exception as e:
             raise PRReconfigurationError(
                 f"Failed to start RM '{self.name}': {e}"
