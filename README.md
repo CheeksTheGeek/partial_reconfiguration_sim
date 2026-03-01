@@ -1,20 +1,14 @@
-# orchestrating simulation of multiple verilator processes for partial reconfiguration using switchboard queues
+# Partial Reconfiguration Simulation Framework
 
-Read `examples/{multi|blinking_led}/test.py` and then run:
+Multi-process Verilator simulation of FPGA partial reconfiguration using DPI-C bridges and shared memory.
+
+See [USAGE.md](USAGE.md) for detailed architecture documentation.
+
+## Quick Start
 
 ```console
-uv pip install git+https://github.com/CheeksTheGeek/switchboard # custom switchboard fork to allow barrier syncing
-```
-
-```console
+uv sync
 uv run examples/blinking_led/test.py
-```
-
-and
-
-```console
 uv run examples/multi/test.py
 ```
-
-to understand how it works.
 

@@ -130,7 +130,7 @@ def test_adder_fresh_state(system):
     result = api.read_result()
 
     tprint(f"Fresh adder result: {result}")
-    tprint(f"(Non-zero because queue bridge auto-forwards static's operands!)")
+    tprint(f"(Non-zero because DPI bridge auto-forwards static's operands!)")
 
     api.write_operand_a(10)
     api.write_operand_b(5)
@@ -139,7 +139,7 @@ def test_adder_fresh_state(system):
         result = api.read_result()
 
     assert result == 15, f"Expected 10 + 5 = 15, got {result}"
-    tprint(f"[PASS] UMI override works: 10 + 5 = {result}")
+    tprint(f"[PASS] Port override works: 10 + 5 = {result}")
 
 
 def test_crypto_accelerator_swap(system):
@@ -230,14 +230,14 @@ def test_static_region_continuity(system):
 
 def test_automatic_static_rm_flow(system):
     """
-    Test 9: Static --> RM data flow via queue bridge.
+    Test 9: Static --> RM data flow via DPI bridge.
     """
     system.reconfigure('rp1', 'adder_rm')
     time.sleep(0.3)
 
     static_api = system.get_static_api()
 
-    tprint("Verifying automatic queue bridge data flow...")
+    tprint("Verifying automatic DPI bridge data flow...")
 
     activity = static_api.read_activity_counter()
     expected_a = activity & 0xFFFF
@@ -246,12 +246,12 @@ def test_automatic_static_rm_flow(system):
     tprint(f"Activity counter: {activity:,}")
     tprint(f"Expected operands: a={expected_a}, b={expected_b}")
     result = static_api.read_computed_result()
-    tprint(f"computed_result (from RM via queue bridge): {result}")
+    tprint(f"computed_result (from RM via DPI bridge): {result}")
 
     if result > 0:
         tprint(f"[OK] Result is flowing back from RM!")
     else:
-        tprint(f"[WARN] Result is 0 - queue may still be filling")
+        tprint(f"[WARN] Result is 0 - data may still be propagating")
     tprint("\nVerifying continuous automatic flow (5 iterations)...")
     results = []
     for i in range(5):
@@ -269,9 +269,9 @@ def test_automatic_static_rm_flow(system):
     unique_results = len(set(results))
     if unique_results > 1:
         tprint(f"\n[PASS] Results are changing ({unique_results} unique values)")
-        tprint(f"       Data flows via queue bridge!")
+        tprint(f"       Data flows via DPI bridge!")
     else:
-        tprint(f"\n[WARN] Results not changing - may need more time for queue")
+        tprint(f"\n[WARN] Results not changing - may need more simulation cycles")
 
     tprint(f"\n[PASS] Automatic static <--> RM flow verified")
 
@@ -352,14 +352,14 @@ def main():
         tprint("Static --> RM Data Flow")
         tprint("-" * 60)
 
-        tprint("\n[12] TEST 9: static <--> RM flow via queue bridge...", t=1)
+        tprint("\n[12] TEST 9: static <--> RM flow via DPI bridge...", t=1)
         test_automatic_static_rm_flow(system)
         tprint("", t=-1)
 
     tprint("\nWhat to notice in the above log ^^^:", t=1)
     tprint("- RTL modules auto-wrapped, Python API uses original signal names")
     tprint("- Static region runs continuously during swaps")
-    tprint("- Queue bridge automatically forwards data between static and RM")
+    tprint("- DPI bridge forwards data between static and RM via shared memory")
     tprint("- Partitions support state reset on reconfiguration")
     tprint("- More complex stuff like crypto accels can be swapped with same interface")
     tprint("")

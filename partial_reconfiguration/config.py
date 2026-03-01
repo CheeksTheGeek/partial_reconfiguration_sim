@@ -22,7 +22,7 @@ except ImportError:
         HAS_TOML = False
 
 
-VALID_INTERFACE_TYPES = ['umi', 'sb', 'axi', 'axil', 'apb', 'gpio']
+VALID_INTERFACE_TYPES = ['sb', 'axi', 'axil', 'apb', 'gpio']
 
 VALID_DIRECTIONS = ['input', 'output', 'manager', 'subordinate', 'inout']
 
@@ -188,8 +188,6 @@ class PRConfig:
         - Port mapping auto-generated when partition and RM port names match
         - Default clocks: ['clk']
         - Default resets: [{'name': 'rst_n', 'polarity': 'negative'}]
-        - Default UMI parameters: dw=256, aw=64, cw=32
-        - Static region interfaces get UMI defaults
         - Partition mapping auto-derived from interface naming convention
 
         After this, a minimal config like:
@@ -199,9 +197,6 @@ class PRConfig:
 
         Becomes fully specified.
         """
-        DEFAULT_UMI_DW = 256
-        DEFAULT_UMI_AW = 64
-        DEFAULT_UMI_CW = 32
         DEFAULT_CLOCKS = ['clk']
         DEFAULT_RESETS = [{'name': 'rst_n', 'polarity': 'negative'}]
 
@@ -210,29 +205,13 @@ class PRConfig:
                 self.static_region['design'] = self.static_region.get('name', 'static_region')
 
             if 'clocks' not in self.static_region:
-                self.static_region['clocks'] = DEFAULT_CLOCKS
+                awc = self.static_region.get('auto_wrap_config', {})
+                if 'clock_name' in awc:
+                    self.static_region['clocks'] = [awc['clock_name']]
+                else:
+                    self.static_region['clocks'] = DEFAULT_CLOCKS
             if 'resets' not in self.static_region:
                 self.static_region['resets'] = DEFAULT_RESETS
-
-            for intf_name, intf_def in self.static_region.get('interfaces', {}).items():
-                if intf_def.get('type') == 'umi':
-                    if 'dw' not in intf_def:
-                        intf_def['dw'] = DEFAULT_UMI_DW
-                    if 'aw' not in intf_def:
-                        intf_def['aw'] = DEFAULT_UMI_AW
-                    if 'cw' not in intf_def:
-                        intf_def['cw'] = DEFAULT_UMI_CW
-
-        for part in self.partitions:
-            if 'interface' in part:
-                for port_name, port_def in part['interface'].items():
-                    if port_def.get('type') == 'umi':
-                        if 'dw' not in port_def:
-                            port_def['dw'] = DEFAULT_UMI_DW
-                        if 'aw' not in port_def:
-                            port_def['aw'] = DEFAULT_UMI_AW
-                        if 'cw' not in port_def:
-                            port_def['cw'] = DEFAULT_UMI_CW
         partition_interfaces = {}
         for part in self.partitions:
             partition_interfaces[part['name']] = part.get('interface', {})
@@ -408,7 +387,6 @@ class PRConfig:
 
             has_interface = 'interface' in part
             has_boundary = 'boundary' in part
-            has_umi_interface = 'umi_interface' in part
 
             if not has_interface and not has_boundary:
                 raise PRConfigError(
@@ -417,9 +395,6 @@ class PRConfig:
 
             if has_interface:
                 self._validate_interface(part['interface'], f"partition '{name}'")
-
-            if has_umi_interface:
-                self._validate_interface(part['umi_interface'], f"partition '{name}' umi_interface")
 
             if has_boundary:
                 self._validate_boundary(part['boundary'], f"partition '{name}'")

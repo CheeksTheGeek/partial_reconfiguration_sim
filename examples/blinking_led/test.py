@@ -129,7 +129,7 @@ def main():
             print("What to notice in the logs above!")
             print("  - Intel RTL used with ZERO modifications")
             print("  - Static region + PR partition architecture")
-            print("  - Auto-wrap: pyslang parses RTL, generates UMI wrappers")
+            print("  - Auto-wrap: pyslang parses RTL, generates Python API")
             print("  - Python API with original signal names")
             print("  - PR swap: load() and reconfigure() swap personas")
         else:

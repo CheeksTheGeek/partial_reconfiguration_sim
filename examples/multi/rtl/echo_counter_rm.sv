@@ -3,17 +3,13 @@
 //============================================================================
 // echo_counter_rm.sv
 //
-// Reconfigurable module designed to expose cycle inaccuracy in queue-based
+// Reconfigurable module for verifying cycle accuracy in DPI-based
 // partial reconfiguration simulation.
 //
 // This RM has its own independent counter and echoes back the static region's
-// counter value. In a truly cycle-accurate simulation:
+// counter value. In a cycle-accurate simulation (shared memory + barrier sync):
 //   - rm_counter and static_counter_in should differ by a CONSTANT offset
 //   - latency_measurement should be CONSTANT
-//
-// With queue-based communication (Switchboard):
-//   - The counters will drift due to variable queue latency
-//   - latency_measurement will VARY, proving cycle inaccuracy
 //============================================================================
 
 module echo_counter_rm (
@@ -42,7 +38,7 @@ module echo_counter_rm (
     //
     // Echo back the static counter value we received. This allows Python to
     // measure round-trip latency: the difference between the current static
-    // counter and the echoed value represents the total queue delay.
+    // counter and the echoed value represents the communication delay.
     //------------------------------------------------------------------------
     always @(posedge clk) begin
         static_counter_echo <= static_counter_in;
@@ -55,10 +51,9 @@ module echo_counter_rm (
     // static counter we received. In a cycle-accurate system, this should
     // be a CONSTANT value (the pipeline depth).
     //
-    // With queue latency:
-    //   - The static_counter_in we see is "stale" by variable amounts
-    //   - rm_counter keeps incrementing while waiting for queue data
-    //   - The difference varies based on queue state and timing
+    // With barrier-synchronized shared memory, this should be constant
+    // (cycle-accurate). The DPI double-buffer swap ensures data arrives
+    // exactly one cycle after it was written.
     //------------------------------------------------------------------------
     always @(posedge clk) begin
         latency_measurement <= rm_counter - static_counter_in;

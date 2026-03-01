@@ -8,7 +8,6 @@ from .exceptions import PRBuildError, PRReconfigurationError
 if TYPE_CHECKING:
     from .system import PRSystem
     from .partition import Partition
-    from .wrapper_generator import WrapperOutput
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +16,7 @@ class ReconfigurableModule:
     """
     Represents a reconfigurable module (RM) that can be loaded into a partition.
 
-    Each RM wraps an SbDut and manages:
+    Each RM manages:
     - Building the simulation binary
     - Starting/stopping the simulation process
     - Port mapping to partition interface
@@ -80,18 +79,10 @@ class ReconfigurableModule:
         is_greybox : bool
             True if this is an auto-generated greybox module
         auto_wrap : bool
-            If True, parse RTL and auto-generate UMI wrapper.
-            The wrapper maps each port to a UMI register address,
-            enabling Python API access via `get_api()`.
+            If True, generate a Python API for reading/writing
+            partition boundary signals via shared memory interface.
         auto_wrap_config : dict
-            Configuration for wrapper generation. Supported keys:
-            - enable_read_back: bool (default True) - Make inputs readable
-            - enable_interrupts: bool (default True) - Generate interrupt logic
-            - address_width: int (default 16) - Address space bits
-            - register_width: int (default 32) - Register width
-            - clock_name: str (default 'clk') - Clock signal name
-            - reset_name: str (default 'rst_n') - Reset signal name
-            - reset_active_low: bool (default True) - Reset polarity
+            Configuration for API generation (reserved for future use).
         ports_override : dict, optional
             Explicit port definitions to use instead of RTL parsing.
             Format: {port_name: {direction: 'input'|'output', width: N, type: 'clock'|'reset'|'data'}}
@@ -119,11 +110,10 @@ class ReconfigurableModule:
 
         self._dut = None
         self._process: Optional[subprocess.Popen] = None
+        self._binary_path: Optional[str] = None  # Path to this RM's binary
         self._built = False
-        self._queue_uris: Dict[str, str] = {}
         self._intf_defs: Dict[str, Dict] = {}
 
-        self._wrapper_output: Optional['WrapperOutput'] = None
         self._module_info = None
         self._api_class = None
 
@@ -141,114 +131,26 @@ class ReconfigurableModule:
         return f'build/pr/rm/{self.name}'
 
     def _create_dut(self):
-        """Create SbDut for this RM."""
-        if self._dut is not None:
-            return self._dut
+        """
+        Placeholder for backward compatibility.
 
-        from switchboard import SbDut
-        from siliconcompiler import Design
-
-        partition = self.partition
-        if partition is None:
-            raise PRBuildError(
-                f"Cannot build RM '{self.name}': partition '{self.partition_name}' not found"
-            )
-
-        intf_defs = {}
-        for part_port, part_def in partition.interface.items():
-            rm_port = self.port_mapping.get(part_port, part_port)
-            intf_def = dict(part_def)
-            if part_port in self.port_compatibility:
-                intf_def.update(self.port_compatibility[part_port])
-            if rm_port in self.interfaces:
-                intf_def.update(self.interfaces[rm_port])
-            if 'wire' not in intf_def:
-                intf_def['wire'] = rm_port
-
-            intf_defs[rm_port] = intf_def
-
-        self._intf_defs = intf_defs
-        design_obj = None
-        if self.sources:
-            top_module_name = self.design or self.name
-            design_obj = Design(top_module_name)
-            with design_obj.active_fileset('rtl'):
-                design_obj.set_topmodule(top_module_name)
-                for source in self.sources:
-                    source_path = Path(source)
-                    if source_path.exists():
-                        design_obj.add_file(str(source_path))
-                    else:
-                        if self.system and self.system.config and self.system.config._source_path:
-                            config_dir = self.system.config._source_path.parent
-                            rel_path = config_dir / source
-                            if rel_path.exists():
-                                design_obj.add_file(str(rel_path))
-                            else:
-                                design_obj.add_file(source)
-                        else:
-                            design_obj.add_file(source)
-
-            with design_obj.active_fileset('verilator'):
-                design_obj.set_topmodule(top_module_name)
-                design_obj.add_depfileset(design_obj, 'rtl')
-            with design_obj.active_fileset('icarus'):
-                design_obj.set_topmodule(top_module_name)
-                design_obj.add_depfileset(design_obj, 'rtl')
-        elif self.design:
-            design_obj = self.design
-        tool = 'verilator'
-        trace = False
-        trace_type = 'vcd'
-        frequency = 100e6
-        max_rate = -1
-
-        if self.system:
-            tool = self.system.tool
-            trace = self.system.trace
-            trace_type = self.system.trace_type
-            frequency = self.system.frequency
-            max_rate = self.system.max_rate
-        cycle_sync = False
-        if self.system and hasattr(self.system, 'cycle_accurate'):
-            cycle_sync = self.system.cycle_accurate
-
-        self._dut = SbDut(
-            design=design_obj,
-            tool=tool,
-            trace=trace,
-            trace_type=trace_type,
-            frequency=frequency,
-            max_rate=max_rate,
-            autowrap=True,
-            parameters=self.parameters,
-            interfaces=intf_defs,
-            clocks=self.clocks,
-            resets=self.resets,
-            tieoffs=self.tieoffs,
-            builddir=self._get_build_dir(),
-            cycle_sync=cycle_sync
-        )
-
-        return self._dut
+        In DPI mode, builds are handled centrally by VerilatorBuilder
+        via PRSystem.build(). Individual RMs don't build independently.
+        """
+        return None
 
     def build(self, fast: bool = False) -> 'ReconfigurableModule':
         """
-        Build the simulation binary for this RM.
+        Build the simulation artifacts for this RM.
 
-        If the partition has a boundary definition, generates a queue wrapper
-        that connects the RM to the static region via queues.
-
-        If auto_wrap is enabled (and no boundary), this will:
-        1. Parse RTL sources to extract port definitions
-        2. Generate UMI wrapper RTL
-        3. Generate Python API, C headers, and JSON address map
-        4. Build the wrapper (which includes the original module)
+        In DPI mode, the actual compilation is handled centrally by
+        VerilatorBuilder via PRSystem.build(). This method generates
+        the Python API if auto_wrap is enabled.
 
         Parameters
         ----------
         fast : bool
-            Skip rebuild if binary exists
+            Skip rebuild if artifacts exist
 
         Returns
         -------
@@ -256,433 +158,91 @@ class ReconfigurableModule:
             Self for method chaining
         """
         try:
-            if self._has_partition_boundary():
-                self._generate_queue_wrapper()
-            elif self.auto_wrap and not self._wrapper_output:
-                self._generate_auto_wrap()
+            if self.auto_wrap and self._api_class is None:
+                self._generate_api()
 
-            dut = self._create_dut()
-            dut.build(fast=fast)
             self._built = True
         except Exception as e:
             raise PRBuildError(f"Failed to build RM '{self.name}': {e}") from e
 
         return self
 
-    def _has_partition_boundary(self) -> bool:
-        """Check if the partition has a boundary definition."""
-        if self.system is None:
-            return False
-
-        partition = self.system.partitions.get(self.partition_name)
-        if partition is None:
-            return False
-
-        return hasattr(partition, '_boundary_config') and partition._boundary_config is not None
-
-    def _generate_queue_wrapper(self):
+    def _generate_api(self):
         """
-        Generate queue wrapper for partition boundary.
+        Generate Python API for this RM using port-index access.
 
-        The queue wrapper:
-        - Receives inputs from partition queues (from static region)
-        - Drives them to the RM
-        - Reads RM outputs and sends them to partition queues
-        - Also provides UMI interface for Python access
+        Gets boundary ports from partition config. Port order:
+        to_rm first (idx 0..T-1), then from_rm (T..T+F-1).
+        This matches signal_access.h indices.
+
+        Does NOT modify self.design or self.sources.
         """
-        from .queue_bridge import QueueBridgeGenerator
-        from .wrapper_generator import (
-            WrapperOutput, AddressMap, AddressRegion, RegisterInfo,
-            AccessType, RegisterType
-        )
-        import json
+        from .codegen.api_generator import ApiGenerator, PortSpec
 
-        partition = self.system.partitions.get(self.partition_name)
-        boundary = partition._boundary_config
-
-        build_dir = Path(self._get_build_dir())
-        queue_dir = Path(self.system.build_dir).resolve() / 'queues'
-        bridge_gen = QueueBridgeGenerator(
-            build_dir=str(build_dir),
-            queue_dir=str(queue_dir)
-        )
-
-        wrapper_path = bridge_gen.generate_rm_side_wrapper(
-            boundary=boundary,
-            rm_sources=self.sources,
-            queue_prefix=self.partition_name,
-            rm_module_name=self.design,
-            include_umi=True
-        )
-
-        self._queue_wrapper_path = wrapper_path
-        original_design = self.design
-        wrapper_name = f"{self.design}_queue_wrapper"
-        self.design = wrapper_name
-
-        self.sources = [str(wrapper_path)] + list(self.sources)
-        registers = {}
-        addr = 0
-        to_rm_ports = [p for p in boundary.ports if p.direction == 'to_rm']
-        from_rm_ports = [p for p in boundary.ports if p.direction == 'from_rm']
-
-        for port in to_rm_ports:
-            registers[port.name] = RegisterInfo(
-                name=port.name,
-                address=addr,
-                width=port.width,
-                access=AccessType.READ_WRITE,
-                reg_type=RegisterType.DATA_INPUT,
-                port_name=port.name,
-                description=f"Input port {port.name} ({port.width} bits)"
-            )
-            addr += 8
-
-        for port in from_rm_ports:
-            registers[port.name] = RegisterInfo(
-                name=port.name,
-                address=addr,
-                width=port.width,
-                access=AccessType.READ_ONLY,
-                reg_type=RegisterType.DATA_OUTPUT,
-                port_name=port.name,
-                description=f"Output port {port.name} ({port.width} bits)"
-            )
-            addr += 8
-
-        region = AddressRegion(
-            name="ports",
-            base_address=0,
-            size=addr,
-            registers=registers,
-            description="Port registers for queue wrapper"
-        )
-
-        address_map = AddressMap(
-            regions={"ports": region},
-            base_address=0,
-            address_width=16,
-            data_width=32
-        )
-
-        python_class_name = ''.join(word.capitalize() for word in original_design.split('_')) + 'API'
-        python_module_code = self._generate_queue_wrapper_python_api(
-            original_design, python_class_name, registers
-        )
-
-        api_path = build_dir / f"{original_design}_api.py"
-        api_path.write_text(python_module_code)
-
-        c_header_code = self._generate_queue_wrapper_c_header(
-            original_design, registers
-        )
-
-        json_map = {
-            "module": original_design,
-            "wrapper": wrapper_name,
-            "registers": {
-                name: {
-                    "address": f"0x{reg.address:04X}",
-                    "width": reg.width,
-                    "access": reg.access.name,
-                    "type": reg.reg_type.name
-                }
-                for name, reg in registers.items()
-            }
-        }
-        json_address_map = json.dumps(json_map, indent=2)
-
-        c_header_path = build_dir / f"{original_design}_regs.h"
-        c_header_path.write_text(c_header_code)
-
-        json_path = build_dir / f"{original_design}_address_map.json"
-        json_path.write_text(json_address_map)
-
-        self._wrapper_output = WrapperOutput(
-            wrapper_rtl=str(wrapper_path),
-            wrapper_name=wrapper_name,
-            address_map=address_map,
-            python_module_code=python_module_code,
-            python_class_name=python_class_name,
-            c_header_code=c_header_code,
-            json_address_map=json_address_map,
-            inner_module_name=original_design
-        )
-
-        logger.info(f"Generated queue wrapper for RM '{self.name}': {wrapper_path}")
-
-    def _generate_queue_wrapper_python_api(
-        self, module_name: str, class_name: str, registers: dict
-    ) -> str:
-        """Generate Python API class for queue wrapper."""
-        lines = []
-        lines.append('"""Auto-generated API for queue wrapper UMI interface."""')
-        lines.append('')
-        lines.append('import numpy as np')
-        lines.append('')
-        lines.append(f'class {class_name}:')
-        lines.append(f'    """')
-        lines.append(f'    API for {module_name} queue wrapper.')
-        lines.append(f'    ')
-        lines.append(f'    Provides Pythonic access to hardware registers via UMI protocol.')
-        lines.append(f'    """')
-        lines.append('')
-
-        lines.append('    # Register addresses')
-        for name, reg in registers.items():
-            lines.append(f'    ADDR_{name.upper()} = 0x{reg.address:04X}')
-        lines.append('')
-
-        lines.append('    def __init__(self, umi):')
-        lines.append('        """')
-        lines.append('        Initialize API with UMI interface.')
-        lines.append('        ')
-        lines.append('        Parameters')
-        lines.append('        ----------')
-        lines.append('        umi : UmiTxRx')
-        lines.append('            Switchboard UMI interface for communication')
-        lines.append('        """')
-        lines.append('        self._umi = umi')
-        lines.append('')
-
-        from .wrapper_generator import RegisterType
-        for name, reg in registers.items():
-            if reg.width <= 8:
-                dtype = 'np.uint8'
-            elif reg.width <= 16:
-                dtype = 'np.uint16'
-            elif reg.width <= 32:
-                dtype = 'np.uint32'
-            else:
-                dtype = 'np.uint64'
-
-            if reg.reg_type == RegisterType.DATA_INPUT:
-                lines.append(f'    def write_{name}(self, value):')
-                lines.append(f'        """')
-                lines.append(f'        Write to {name} register.')
-                lines.append(f'        ')
-                lines.append(f'        Address: 0x{reg.address:04X}')
-                lines.append(f'        Width: {reg.width} bits')
-                lines.append(f'        Access: {reg.access.name}')
-                lines.append(f'        """')
-                lines.append(f'        self._umi.write(self.ADDR_{name.upper()}, {dtype}(value))')
-                lines.append('')
-
-                lines.append(f'    def read_{name}(self):')
-                lines.append(f'        """')
-                lines.append(f'        Read current value of {name} register.')
-                lines.append(f'        ')
-                lines.append(f'        Address: 0x{reg.address:04X}')
-                lines.append(f'        Width: {reg.width} bits')
-                lines.append(f'        """')
-                lines.append(f'        return int(self._umi.read(self.ADDR_{name.upper()}, {dtype}))')
-                lines.append('')
-
-            elif reg.reg_type == RegisterType.DATA_OUTPUT:
-                lines.append(f'    def read_{name}(self):')
-                lines.append(f'        """')
-                lines.append(f'        Read from {name} output.')
-                lines.append(f'        ')
-                lines.append(f'        Address: 0x{reg.address:04X}')
-                lines.append(f'        Width: {reg.width} bits')
-                lines.append(f'        Access: {reg.access.name}')
-                lines.append(f'        """')
-                lines.append(f'        return int(self._umi.read(self.ADDR_{name.upper()}, {dtype}))')
-                lines.append('')
-
-        return '\n'.join(lines)
-
-    def _generate_queue_wrapper_c_header(self, module_name: str, registers: dict) -> str:
-        """Generate C header file for queue wrapper registers."""
-        guard = f"{module_name.upper()}_REGS_H"
-
-        lines = []
-        lines.append(f'/*')
-        lines.append(f' * Auto-generated register definitions for {module_name} queue wrapper')
-        lines.append(f' * Generated by Switchboard PR simulation')
-        lines.append(f' */')
-        lines.append('')
-        lines.append(f'#ifndef {guard}')
-        lines.append(f'#define {guard}')
-        lines.append('')
-        lines.append('#include <stdint.h>')
-        lines.append('')
-
-        lines.append('/* Register addresses */')
-        for name, reg in registers.items():
-            lines.append(f'#define {module_name.upper()}_{name.upper()}_ADDR  0x{reg.address:04X}')
-        lines.append('')
-
-        lines.append('/* Register widths (bits) */')
-        for name, reg in registers.items():
-            lines.append(f'#define {module_name.upper()}_{name.upper()}_WIDTH {reg.width}')
-        lines.append('')
-
-        lines.append('/* Helper macros */')
-        lines.append(f'#define {module_name.upper()}_BASE_ADDR 0x0000')
-        lines.append(f'#define {module_name.upper()}_ADDR_SPACE_SIZE 0x{max(r.address + 8 for r in registers.values()):04X}')
-        lines.append('')
-
-        lines.append(f'#endif /* {guard} */')
-
-        return '\n'.join(lines)
-
-    def _generate_auto_wrap(self):
-        """
-        Parse RTL and generate UMI wrapper.
-
-        This parses the RTL sources to extract port definitions,
-        then generates:
-        - UMI wrapper RTL (wrapper instantiates original module)
-        - Python API module
-        - C header file
-        - JSON address map
-
-        If ports_override is provided, RTL parsing is skipped and the
-        explicit port definitions are used directly.
-        """
-        from .rtl_parser import RTLParser, PortClassification, ModuleInfo, PortInfo
-        from .wrapper_generator import UMIWrapperGenerator, WrapperConfig
+        port_specs = self._get_boundary_ports()
+        if not port_specs:
+            logger.warning(f"No boundary ports found for RM '{self.name}', skipping API generation")
+            return
 
         module_name = self.design or self.name
+        generator = ApiGenerator()
+        class_name = generator._class_name_from(module_name)
+        self._api_class = generator.generate_api_class(class_name, module_name, port_specs)
+        logger.info(f"Generated API for RM '{self.name}': {len(port_specs)} ports")
 
-        if self.ports_override:
-            logger.info(f"Using explicit ports override for: {self.name}")
-            self._module_info = self._create_module_info_from_override(module_name)
-        else:
-            if not self.sources:
-                raise PRBuildError(
-                    f"RM '{self.name}' has auto_wrap=True but no sources specified "
-                    f"and no ports_override provided"
-                )
-
-            resolved_sources = []
-            for source in self.sources:
-                source_path = Path(source)
-                if source_path.exists():
-                    resolved_sources.append(str(source_path.resolve()))
-                elif self.system and self.system.config and self.system.config._source_path:
-                    config_dir = self.system.config._source_path.parent
-                    rel_path = config_dir / source
-                    if rel_path.exists():
-                        resolved_sources.append(str(rel_path.resolve()))
-                    else:
-                        raise PRBuildError(f"Source file not found: {source}")
-                else:
-                    raise PRBuildError(f"Source file not found: {source}")
-
-            logger.info(f"Parsing RTL for auto-wrap: {self.name}")
-            parser = RTLParser()
-            try:
-                self._module_info = parser.parse_module(resolved_sources, module_name)
-            except Exception as e:
-                raise PRBuildError(f"Failed to parse RTL for '{self.name}': {e}") from e
-
-            warnings = parser.validate_ports(self._module_info)
-            for warning in warnings:
-                logger.warning(f"[{self.name}] {warning}")
-
-        config = WrapperConfig(
-            enable_read_back=self.auto_wrap_config.get('enable_read_back', True),
-            enable_interrupts=self.auto_wrap_config.get('enable_interrupts', True),
-            enable_wide_burst=self.auto_wrap_config.get('enable_wide_burst', True),
-            enable_inout=self.auto_wrap_config.get('enable_inout', True),
-            address_width=self.auto_wrap_config.get('address_width', 16),
-            register_width=self.auto_wrap_config.get('register_width', 32),
-        )
-
-        logger.info(f"Generating UMI wrapper for: {self.name}")
-        generator = UMIWrapperGenerator(config)
-        self._wrapper_output = generator.generate(self._module_info)
-
-        if not self._wrapper_output.is_valid:
-            for error in self._wrapper_output.validation_errors:
-                logger.error(f"[{self.name}] {error}")
-            raise PRBuildError(
-                f"Auto-wrap validation failed for '{self.name}': "
-                f"{len(self._wrapper_output.validation_errors)} errors"
-            )
-
-        for warning in self._wrapper_output.validation_warnings:
-            logger.warning(f"[{self.name}] {warning}")
-        build_dir = Path(self._get_build_dir())
-        build_dir.mkdir(parents=True, exist_ok=True)
-
-        wrapper_path = build_dir / f"{self._wrapper_output.wrapper_name}.sv"
-        wrapper_path.write_text(self._wrapper_output.wrapper_rtl)
-        logger.info(f"Wrote wrapper RTL: {wrapper_path}")
-
-        api_path = build_dir / f"{self._module_info.name}_api.py"
-        api_path.write_text(self._wrapper_output.python_module_code)
-        logger.info(f"Wrote Python API: {api_path}")
-
-        header_path = build_dir / f"{self._module_info.name}_regs.h"
-        header_path.write_text(self._wrapper_output.c_header_code)
-        logger.info(f"Wrote C header: {header_path}")
-
-        json_path = build_dir / f"{self._module_info.name}_regs.json"
-        json_path.write_text(self._wrapper_output.json_address_map)
-        logger.info(f"Wrote JSON address map: {json_path}")
-
-        self.sources = [str(wrapper_path)] + resolved_sources
-
-        self.design = self._wrapper_output.wrapper_name
-
-        logger.info(f"Auto-wrap complete for '{self.name}': {len(self._module_info.ports)} ports mapped")
-
-    def _create_module_info_from_override(self, module_name: str):
+    def _get_boundary_ports(self) -> List:
         """
-        Create ModuleInfo from explicit ports_override configuration.
+        Extract PortSpec list from partition config boundary.
 
-        This allows users to specify port definitions in YAML config instead of
-        relying on pyslang RTL parsing. Useful when:
-        - pyslang cannot parse the RTL (unsupported constructs)
-        - User wants to exclude certain ports from wrapping
-        - User wants to override inferred port types
-
-        Parameters
-        ----------
-        module_name : str
-            Name of the module
-
-        Returns
-        -------
-        ModuleInfo
-            Module info with ports from override
+        Returns to_rm ports first (idx 0..T-1), then from_rm (T..T+F-1).
         """
-        from .rtl_parser import ModuleInfo, PortInfo
+        from .codegen.api_generator import PortSpec
 
-        ports = []
-        for port_name, port_def in self.ports_override.items():
-            direction = port_def.get('direction', 'input')
-            width = port_def.get('width', 1)
-            port_type = port_def.get('type', 'data')
+        if self.system is None or self.system.config is None:
+            return []
 
-            port_info = PortInfo(
-                name=port_name,
-                direction=direction,
-                width=width,
-                port_type=port_type,
-                is_signed=port_def.get('signed', False),
-                is_array=False,
-                array_dimensions=[]
-            )
-            ports.append(port_info)
+        # Find partition config with boundary
+        for part_cfg in self.system.config.partitions:
+            if part_cfg['name'] != self.partition_name:
+                continue
+            if 'boundary' not in part_cfg:
+                return []
 
-        return ModuleInfo(name=module_name, ports=ports)
+            boundary = part_cfg['boundary']
+            to_rm_ports = [p for p in boundary if p['direction'] == 'to_rm']
+            from_rm_ports = [p for p in boundary if p['direction'] == 'from_rm']
 
-    def get_api(self, umi=None):
+            port_specs = []
+            idx = 0
+            for port in to_rm_ports:
+                port_specs.append(PortSpec(
+                    name=port['name'],
+                    width=port.get('width', 1),
+                    direction='to_rm',
+                    index=idx,
+                ))
+                idx += 1
+            for port in from_rm_ports:
+                port_specs.append(PortSpec(
+                    name=port['name'],
+                    width=port.get('width', 1),
+                    direction='from_rm',
+                    index=idx,
+                ))
+                idx += 1
+
+            return port_specs
+
+        return []
+
+    def get_api(self, shm=None):
         """
         Get the auto-generated Python API for this RM.
 
-        This method returns an API class that provides typed read/write
-        methods for all accessible registers, using the original port names.
-
         Parameters
         ----------
-        umi : UmiTxRx, optional
-            UMI interface to use. If not provided, will try to get from
-            the partition's interfaces.
+        shm : SharedMemoryInterface, optional
+            Shared memory interface to use.
 
         Returns
         -------
@@ -693,10 +253,9 @@ class ReconfigurableModule:
         -------
         ```python
         rm = system.get_rm('my_module')
-        api = rm.get_api(umi)
-
-        api.write_counter(0x12345678)
-        led_state = api.read_led_status()
+        api = rm.get_api(shm)
+        api.write_counter(42)
+        result = api.read_result()
         ```
         """
         if not self.auto_wrap:
@@ -705,180 +264,66 @@ class ReconfigurableModule:
             )
             return None
 
-        if self._wrapper_output is None:
+        if self._api_class is None:
             raise PRBuildError(
                 f"RM '{self.name}' has not been built yet. Call build() first."
             )
 
-        if umi is None:
-            if self.partition and hasattr(self.partition, '_intfs'):
-                for intf_name, intf in self.partition._intfs.items():
-                    if hasattr(intf, 'read') and hasattr(intf, 'write'):
-                        umi = intf
-                        break
+        return self._api_class(shm)
 
-            if umi is None:
-                raise ValueError(
-                    f"No UMI interface provided and could not find one for RM '{self.name}'"
-                )
-        if self._api_class is None:
-            import importlib.util
-            import sys
-
-            build_dir = Path(self._get_build_dir())
-            module_name_for_api = self._wrapper_output.inner_module_name
-            api_path = build_dir / f"{module_name_for_api}_api.py"
-
-            if not api_path.exists():
-                raise PRBuildError(f"API file not found: {api_path}")
-
-            module_name = f"generated_api_{self.name}"
-            spec = importlib.util.spec_from_file_location(module_name, api_path)
-            module = importlib.util.module_from_spec(spec)
-            sys.modules[module_name] = module
-            spec.loader.exec_module(module)
-
-            self._api_class = getattr(module, self._wrapper_output.python_class_name)
-
-        return self._api_class(umi)
-
-    @property
-    def wrapper_output(self) -> Optional['WrapperOutput']:
-        """Get the wrapper output if auto_wrap was used."""
-        return self._wrapper_output
-
-    @property
-    def address_map(self):
-        """Get the address map if auto_wrap was used."""
-        if self._wrapper_output:
-            return self._wrapper_output.address_map
-        return None
-
-    def configure_queues(self, queue_uris: Dict[str, str]):
+    def start(self, extra_plusargs: List[str] = None) -> Optional[subprocess.Popen]:
         """
-        Configure queue URIs for partition ports.
+        Mark the RM as started.
 
-        This maps partition port names to queue URIs, then translates
-        to RM port names using the port mapping.
-
-        Parameters
-        ----------
-        queue_uris : dict
-            Mapping from partition port names to queue URIs
-        """
-        self._queue_uris = {}
-
-        for part_port, uri in queue_uris.items():
-            rm_port = self.port_mapping.get(part_port, part_port)
-            self._queue_uris[rm_port] = uri
-
-            if rm_port in self._intf_defs:
-                self._intf_defs[rm_port]['uri'] = uri
-        if self._dut is not None:
-            for rm_port, uri in self._queue_uris.items():
-                if rm_port in self._dut.intf_defs:
-                    self._dut.intf_defs[rm_port]['uri'] = uri
-
-    def start(self, extra_plusargs: List[str] = None) -> subprocess.Popen:
-        """
-        Start the RM simulation process.
-
-        This creates a fresh Verilator process with reset state.
-        All registers will be initialized to their reset values.
-
-        Note: Python interface objects are NOT created here - they are
-        owned by the Partition and persist across RM swaps.
+        In DPI mode, the RM runs as a thread inside the single simulation
+        binary managed by SimulationProcessManager. This method just marks the
+        RM as active.
 
         Parameters
         ----------
         extra_plusargs : list, optional
-            Additional plusargs to pass to the simulator.
-            Used for barrier synchronization in cycle-accurate mode.
+            Unused in DPI mode.
 
         Returns
         -------
-        subprocess.Popen
-            Running process handle
+        None
+            No separate process in DPI mode.
         """
         if not self._built:
             self.build()
 
-        dut = self._dut
-
-        for rm_port, uri in self._queue_uris.items():
-            if rm_port in dut.intf_defs:
-                dut.intf_defs[rm_port]['uri'] = uri
-                logger.info(f"[{self.name}] Set interface '{rm_port}' URI to '{uri}'")
-            else:
-                logger.warning(f"[{self.name}] Interface '{rm_port}' not found in dut.intf_defs: {list(dut.intf_defs.keys())}")
-
-        # Debug: print all interface definitions and plusargs
-        logger.info(f"[{self.name}] intf_defs before simulate: {dut.intf_defs}")
-
-        # Debug: print what plusargs will be generated
-        plusargs = []
-        for name, value in dut.intf_defs.items():
-            wire = value.get('wire', None)
-            uri = value.get('uri', None)
-            if (wire is not None) and (uri is not None):
-                plusargs.append((wire, uri))
-        logger.info(f"[{self.name}] Expected plusargs: {plusargs}")
-        try:
-            self._process = dut.simulate(
-                plusargs=extra_plusargs or [],
-                intf_objs=False
-            )
-        except Exception as e:
-            raise PRReconfigurationError(
-                f"Failed to start RM '{self.name}': {e}"
-            ) from e
-
-        return self._process
+        logger.info(f"RM '{self.name}' marked as started (DPI mode)")
+        return None
 
     def terminate(self, timeout: float = 10.0):
         """
-        Terminate the RM simulation process and wait for it to exit.
+        Mark the RM as terminated.
 
-        This method ensures the process has fully exited before returning.
-        This is critical for PR simulation - we must guarantee the old RM
-        is completely stopped before starting a new one, otherwise both
-        processes could be accessing the same queues simultaneously.
+        In DPI mode, the RM thread lifecycle is managed by the C++ driver.
+        Reconfiguration swaps the model within the existing thread.
+        This method just clears the process reference.
 
         Parameters
         ----------
         timeout : float
-            Timeout for graceful termination before force kill
+            Unused in DPI mode.
         """
-        if self._process is None:
-            return
-
-        try:
-            if self._dut is not None:
-                self._dut.terminate(stop_timeout=timeout)
-
-            if self._process is not None:
-                try:
-                    self._process.wait(timeout=timeout)
-                except subprocess.TimeoutExpired:
-                    self._process.kill()
-                    self._process.wait()
-
-        except Exception:
-            if self._process is not None:
-                try:
-                    self._process.kill()
-                    self._process.wait()
-                except Exception:
-                    pass
-
         self._process = None
 
     @property
     def is_running(self) -> bool:
-        """Check if RM process is currently running."""
-        if self._process is None:
-            return False
-        return self._process.poll() is None
+        """Check if RM is currently active in a partition.
+
+        In multi-binary mode, checks if this RM is the active RM
+        in its partition and the partition's RM process is alive.
+        """
+        if self.system and hasattr(self.system, '_sim_process') and self.system._sim_process:
+            partition = self.partition
+            if partition and partition.active_rm is self:
+                return self.system._sim_process.is_running
+        if self._process is not None:
+            return self._process.poll() is None
+        return False
 
     @property
     def is_built(self) -> bool:

@@ -67,7 +67,6 @@ class PortValidator:
     - relaxed: Most permissive, useful for testing
     """
     DEFAULT_WIDTHS = {
-        'umi': {'dw': 256, 'aw': 64, 'cw': 32},
         'sb': {'dw': 256},
         'axi': {'dw': 32, 'aw': 32, 'idw': 4},
         'axil': {'dw': 32, 'aw': 32},

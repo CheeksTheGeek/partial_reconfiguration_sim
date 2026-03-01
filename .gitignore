@@ -50,7 +50,7 @@ obj_dir
 *.mt0
 *.wrapper*
 
-# queues
+# legacy queue files (no longer used)
 queue-*
 *.q
 

@@ -39,10 +39,10 @@ def run_test_latency_variance(echo_api, static_api):
     - Both counters increment at the same rate (same clock)
     - The difference should be CONSTANT (equal to pipeline delay)
 
-    With queue latency:
-    - Queue introduces variable delay
-    - The difference VARIES over time
-    - Variance > 0 proves cycle inaccuracy
+    With DPI shared-memory + barrier sync:
+    - Both counters should be perfectly synchronized
+    - The difference should be CONSTANT
+    - Variance = 0 proves cycle accuracy
     """
     tprint("")
     tprint("=" * 70)
@@ -157,7 +157,7 @@ def run_test_latency_variance(echo_api, static_api):
     # Assertion 1: Latency should be constant (variance = 0)
     if latency_variance > 0:
         tprint(f"[FAIL] Latency variance is {latency_variance:.2f}, expected 0")
-        tprint("       -> PROVES: Queue introduces variable delay")
+        tprint("       -> Latency variance detected")
         cycle_accurate = False
     else:
         tprint(f"[PASS] Latency variance is 0")
@@ -182,11 +182,11 @@ def run_test_latency_variance(echo_api, static_api):
 
     # Assertion 4: In true cycle-accurate, RM counter should equal static counter
     # (or differ by exactly the pipeline depth, which should be ~2-3 cycles)
-    # A large mean latency indicates significant queue buffering
+    # A large mean latency indicates unexpected pipeline depth
     EXPECTED_PIPELINE_DEPTH = 3  # Reasonable for direct connection
     if abs(latency_mean) > EXPECTED_PIPELINE_DEPTH * 10:
         tprint(f"[FAIL] Mean latency is {latency_mean:.0f} cycles, expected ~{EXPECTED_PIPELINE_DEPTH}")
-        tprint("       -> PROVES: Queue adds significant buffering delay")
+        tprint("       -> Mean latency exceeds expected pipeline depth")
         cycle_accurate = False
     else:
         tprint(f"[PASS] Mean latency is within expected range")
@@ -198,8 +198,8 @@ def run_test_latency_variance(echo_api, static_api):
         tprint("CONCLUSION: CYCLE INACCURACY DETECTED")
         tprint("")
         tprint("The static region and RM run as independent processes.")
-        tprint("Switchboard queues introduce variable latency that breaks")
-        tprint("cycle-level synchronization between the two domains.")
+        tprint("Communication latency between static and RM processes is not")
+        tprint("perfectly constant, indicating a cycle synchronization issue.")
 
     return cycle_accurate
 
@@ -211,8 +211,8 @@ def run_test_counter_correlation(echo_api, static_api):
     If cycle-accurate, the RM's counter and static's counter should be perfectly
     correlated (linear relationship with R^2 = 1.0).
 
-    With queue latency, the correlation will be imperfect because the RM's view
-    of the static counter is delayed by variable amounts.
+    With barrier-synchronized shared memory, the correlation should be perfect
+    (R^2 = 1.0) since data arrives with constant latency.
     """
     tprint("")
     tprint("=" * 70)
@@ -256,7 +256,7 @@ def run_test_counter_correlation(echo_api, static_api):
     # Check if correlation is perfect
     if r_squared < 0.9999:
         tprint(f"[FAIL] R^2 is {r_squared:.6f}, expected 1.0 for cycle-accurate")
-        tprint("       -> PROVES: Counters drift due to async queue communication")
+        tprint("       -> Counters are not perfectly correlated")
         return False
     else:
         tprint(f"[PASS] R^2 is near 1.0")
@@ -381,7 +381,7 @@ def main():
             tprint("CYCLE INACCURACY DETECTED")
             tprint("")
             if not latency_passed:
-                tprint("- Latency variance > 0 indicates variable queue delay")
+                tprint("- Latency variance > 0 indicates variable communication delay")
             if not correlation_passed:
                 tprint("- Counter correlation < 1.0 indicates counter drift")
             return 1

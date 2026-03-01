@@ -28,7 +28,7 @@ module static_region (
 
     // ========================================================================
     // Partition rp0: counter_rm (or passthrough_rm)
-    // is replaced by a bridge for switchboard
+    // Replaced by DPI bridge during simulation
     // ========================================================================
     counter_rm u_counter_rm (
         .clk(clk),
@@ -36,7 +36,7 @@ module static_region (
     );
     // ========================================================================
     // Partition rp1: adder_rm (or subtractor_rm, cipher RMs)
-    // This instantiation will be REPLACED by a queue bridge during simulation
+    // This instantiation is replaced by a DPI bridge during simulation
     // ========================================================================
     adder_rm u_adder_rm (
         .clk(clk),

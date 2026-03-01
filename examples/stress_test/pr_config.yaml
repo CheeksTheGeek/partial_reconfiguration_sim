@@ -1,0 +1,78 @@
+version: "1.0"
+
+simulation:
+  tool: verilator
+  trace: false
+  build_dir: build
+
+static_region:
+  name: static_region
+  design: static_region
+  sources:
+    - rtl/static_region.sv
+  auto_wrap: true
+  auto_wrap_config:
+    clock_name: clk
+    enable_read_back: true
+
+partitions:
+  # Partition 1: Mixed-width boundary (1-bit, 8-bit, 16-bit, 32-bit)
+  - name: rp_wide
+    rm_module: mixed_width_rm
+    clock: clk
+    boundary:
+      - { name: enable,      direction: to_rm,   width: 1 }
+      - { name: byte_in,     direction: to_rm,   width: 8 }
+      - { name: half_in,     direction: to_rm,   width: 16 }
+      - { name: word_in,     direction: to_rm,   width: 32 }
+      - { name: flag_out,    direction: from_rm,  width: 1 }
+      - { name: status_byte, direction: from_rm,  width: 8 }
+      - { name: result_half, direction: from_rm,  width: 16 }
+      - { name: result_word, direction: from_rm,  width: 32 }
+    initial_rm: mixed_width_rm
+
+  # Partition 2: Many-port boundary (4 in + 4 out = 8 ports)
+  - name: rp_many
+    rm_module: many_port_rm
+    clock: clk
+    boundary:
+      - { name: in_0, direction: to_rm,   width: 32 }
+      - { name: in_1, direction: to_rm,   width: 32 }
+      - { name: in_2, direction: to_rm,   width: 32 }
+      - { name: in_3, direction: to_rm,   width: 32 }
+      - { name: out_0, direction: from_rm, width: 32 }
+      - { name: out_1, direction: from_rm, width: 32 }
+      - { name: out_2, direction: from_rm, width: 32 }
+      - { name: out_3, direction: from_rm, width: 32 }
+    initial_rm: many_port_rm
+
+reconfigurable_modules:
+  # --- rp_wide RMs ---
+  - name: mixed_width_rm
+    partition: rp_wide
+    design: mixed_width_rm
+    sources: [rtl/mixed_width_rm.sv]
+    auto_wrap: true
+    auto_wrap_config: { clock_name: clk }
+
+  - name: mixed_width_alt_rm
+    partition: rp_wide
+    design: mixed_width_alt_rm
+    sources: [rtl/mixed_width_alt_rm.sv]
+    auto_wrap: true
+    auto_wrap_config: { clock_name: clk }
+
+  # --- rp_many RMs ---
+  - name: many_port_rm
+    partition: rp_many
+    design: many_port_rm
+    sources: [rtl/many_port_rm.sv]
+    auto_wrap: true
+    auto_wrap_config: { clock_name: clk }
+
+  - name: many_port_alt_rm
+    partition: rp_many
+    design: many_port_alt_rm
+    sources: [rtl/many_port_alt_rm.sv]
+    auto_wrap: true
+    auto_wrap_config: { clock_name: clk }

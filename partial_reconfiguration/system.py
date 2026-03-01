@@ -12,8 +12,9 @@ from .static import StaticRegion
 from .reconfiguration import ResetBehavior
 from .exceptions import PRConfigError, PRValidationError, PRReconfigurationError, PRBuildError
 from .barrier import CycleBarrier
-
-from switchboard.util import ProcessCollection
+from .verilator_builder import VerilatorBuilder
+from .sim_process import SimulationProcessManager
+from .shm_interface import SharedMemoryInterface
 
 logger = logging.getLogger(__name__)
 
@@ -104,9 +105,13 @@ class PRSystem:
         self._static_region: Optional[StaticRegion] = None
         self.partitions: Dict[str, Partition] = {}
         self.modules: Dict[str, ReconfigurableModule] = {}
-        self._ctrl_umi = None
+        self._ctrl_shm = None
         self._timing_model = ConfigurationTimingModel(enabled=config_timing)
-        self.process_collection = ProcessCollection()
+        self._sim_process: Optional[SimulationProcessManager] = None
+        self._builder: Optional[VerilatorBuilder] = None
+        self._shm_interfaces: Dict[str, SharedMemoryInterface] = {}
+        self._binary_paths: Dict[str, Path] = {}  # 'static', 'rm/name' -> Path
+        self._rm_binary_map: Dict[str, str] = {}  # rm_name -> binary_path
         self._built = False
         self._running = False
         self._validated = False
@@ -122,32 +127,12 @@ class PRSystem:
 
     def __enter__(self):
         """
-        Initialize queue lifecycle correctly.
+        Initialize simulation lifecycle.
 
-        This is the key to eliminating race conditions: we delete all
-        queues BEFORE anything connects. Then:
-        1. Static region starts and connects to queue files
-        2. RMs start and connect to partition-facing queue files
-        3. Python interfaces connect with fresh=False to same files
-        4. Everyone is talking to the same queues
-
-        Queue architecture with static region:
-        - ext_req.q / ext_resp.q: Python ↔ Static Region
-        - ctrl_req.q / ctrl_resp.q: Python ↔ Static Region (isolation control)
-        - rp0_req.q / rp0_resp.q: Static Region ↔ RM
+        Sets up shared memory for multi-process communication.
+        DPI channels use mmap'd shared memory
+        between static binary and RM binaries.
         """
-        from switchboard import delete_queues
-
-        all_uris = []
-        if self._static_region is not None:
-            for intf_name in self._static_region.interfaces:
-                all_uris.append(f"{intf_name}.q")
-        for partition in self.partitions.values():
-            all_uris.extend(partition._queue_uris.values())
-        if all_uris:
-            delete_queues(all_uris)
-            logger.debug(f"Deleted {len(all_uris)} queues: {all_uris}")
-
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -186,27 +171,27 @@ class PRSystem:
             self.build()
         elif not rm.is_built:
             rm.build()
-        if self._static_region is not None and not self._static_region.is_running:
-            logger.info("Starting static region (runs continuously during simulation)")
-            proc = self._static_region.start(start_delay=self.start_delay)
-            self.process_collection.add(proc)
-        self.partitions[partition_name].load_rm(rm)
+        if not self._running:
+            self.simulate(initial_rms={partition_name: rm_name})
+        else:
+            self.partitions[partition_name].load_rm(rm)
 
         self._running = True
         return self
 
     def _parse_cmdline(self):
         """Parse command line arguments."""
-        from switchboard.cmdline import get_cmdline_args
+        import argparse
 
-        args = get_cmdline_args(
-            tool=self.tool,
-            trace=self.trace,
-            trace_type=self.trace_type,
-            frequency=self.frequency,
-            max_rate=self.max_rate,
-            start_delay=self.start_delay
-        )
+        parser = argparse.ArgumentParser(add_help=False)
+        parser.add_argument('--tool', default=self.tool)
+        parser.add_argument('--trace', action='store_true', default=self.trace)
+        parser.add_argument('--trace-type', default=self.trace_type)
+        parser.add_argument('--frequency', type=float, default=self.frequency)
+        parser.add_argument('--max-rate', type=float, default=self.max_rate)
+        parser.add_argument('--start-delay', type=float, default=self.start_delay)
+
+        args, _ = parser.parse_known_args()
 
         self.tool = args.tool
         self.trace = args.trace
@@ -264,15 +249,10 @@ class PRSystem:
         if self.config.static_region:
             self._setup_static_region(self.config.static_region)
         for part_cfg in self.config.partitions:
-            if 'boundary' in part_cfg and 'umi_interface' in part_cfg:
-                interface = part_cfg['umi_interface']
-            elif 'interface' in part_cfg:
+            if 'interface' in part_cfg:
                 interface = part_cfg['interface']
             else:
-                interface = {
-                    'req': {'type': 'umi', 'direction': 'input', 'dw': 256, 'aw': 64, 'cw': 32},
-                    'resp': {'type': 'umi', 'direction': 'output', 'dw': 256, 'aw': 64, 'cw': 32}
-                }
+                interface = {}
 
             partition = Partition(
                 name=part_cfg['name'],
@@ -310,13 +290,21 @@ class PRSystem:
 
     def _setup_static_region(self, sr_cfg: Dict):
         """Set up static region from configuration."""
+        # Support both 'clock' (singular) and 'clocks' (list) config keys.
+        # pyslang auto-detects clock from RTL in _setup_builder(), so this
+        # is only a fallback for when pyslang isn't available.
+        if 'clock' in sr_cfg:
+            clocks = [sr_cfg['clock']]
+        else:
+            clocks = sr_cfg.get('clocks', ['clk'])
+
         self._static_region = StaticRegion(
             name=sr_cfg.get('name', 'static_region'),
             design=sr_cfg.get('design'),
             sources=sr_cfg.get('sources', []),
             parameters=sr_cfg.get('parameters', {}),
             interfaces=sr_cfg.get('interfaces', {}),
-            clocks=sr_cfg.get('clocks', ['clk']),
+            clocks=clocks,
             resets=sr_cfg.get('resets', []),
             system=self,
             build_dir=f"{self.build_dir}/static",
@@ -488,17 +476,18 @@ class PRSystem:
 
     def build(self, fast: bool = False) -> 'PRSystem':
         """
-        Build all simulations (static region + all RMs).
+        Build all simulation binaries (multi-binary architecture).
 
-        For partitions with boundary definitions, this:
-        1. Generates queue bridges for the static region side
-        2. Generates queue wrappers for the RM side
-        3. Connects them via Switchboard queues
+        Uses VerilatorBuilder to:
+        1. Generate DPI bridges for each partition boundary
+        2. Generate DPI C++ code (static_driver, rm_drivers, channels)
+        3. Verilate all modules (static + RM wrappers)
+        4. Compile and link into N+1 simulation binaries
 
         Parameters
         ----------
         fast : bool
-            Skip rebuild if binary exists
+            Skip rebuild if static_binary exists
 
         Returns
         -------
@@ -507,38 +496,135 @@ class PRSystem:
         """
         if not self._validated:
             self.validate()
-        self._generate_partition_bridges()
-        if self._static_region is not None:
-            self._static_region.build(fast=fast)
-        for rm in self.modules.values():
-            rm.build(fast=fast)
+
+        static_binary_path = Path(self.build_dir) / 'static_binary'
+        if fast and static_binary_path.exists():
+            logger.info("Skipping build (fast=True and static_binary exists)")
+            self._built = True
+            # Reconstruct binary paths from filesystem
+            self._binary_paths = {'static': static_binary_path}
+            for part_name, partition in self.partitions.items():
+                for rm_name, rm in partition.registered_rms.items():
+                    rm_path = Path(self.build_dir) / 'rm' / rm_name / 'rm_binary'
+                    if rm_path.exists():
+                        self._binary_paths[f'rm/{rm_name}'] = rm_path
+                        self._rm_binary_map[rm_name] = str(rm_path)
+                    if not rm._built:
+                        rm.build()
+            return self
+
+        self._builder = VerilatorBuilder(
+            build_dir=self.build_dir,
+            trace=self.trace,
+            trace_type=self.trace_type,
+        )
+
+        self._setup_builder()
+        self._binary_paths = self._builder.build()
+
+        # Build static region and RMs AFTER builder (generates API classes
+        # for get_api()). Must be after _setup_builder() which populates
+        # _static_ports_for_api used by _generate_api().
+        if self._static_region and not self._static_region._built:
+            self._static_region.build()
+        for partition in self.partitions.values():
+            for rm in partition.registered_rms.values():
+                if not rm._built:
+                    rm.build()
+
+        # Build rm_name -> binary_path lookup
+        for key, path in self._binary_paths.items():
+            if key.startswith('rm/'):
+                rm_name = key[3:]  # strip 'rm/' prefix
+                self._rm_binary_map[rm_name] = str(path)
 
         self._built = True
         return self
 
-    def _generate_partition_bridges(self):
-        """
-        Generate queue bridges for partitions with boundary definitions.
+    def _setup_builder(self):
+        """Configure the VerilatorBuilder from system config."""
+        if self._builder is None:
+            raise PRBuildError("Builder not initialized")
 
-        For each partition with a 'boundary' in config:
-        1. Generate static-side queue bridge (replaces RM module in static region)
-        2. Store bridge info for RM-side wrapper generation
+        if self._static_region is None:
+            raise PRBuildError("No static region configured")
 
-        The static-side bridge has the same module name as the RM, so when
-        static region is compiled, it uses the bridge instead of the real RM.
-        """
+        # Resolve static region sources
+        static_sources = self._resolve_sources(self._static_region.sources)
+        static_design = self._static_region.design if isinstance(
+            self._static_region.design, str
+        ) else self._static_region.name
+
+        # Collect static region ports for signal access
+        static_ports = []
+        if self._static_region.ports_override:
+            for port_name, port_def in self._static_region.ports_override.items():
+                static_ports.append({
+                    'name': port_name,
+                    'width': port_def.get('width', 1),
+                    'direction': port_def.get('direction', 'input'),
+                })
+        elif self._static_region._module_info:
+            # Use already-parsed port info
+            for port_name, port in self._static_region._module_info.ports.items():
+                if port_name in ('clk', 'rst', 'reset', 'rst_n', 'reset_n'):
+                    continue
+                static_ports.append({
+                    'name': port_name,
+                    'width': port.width,
+                    'direction': port.direction,
+                })
+        elif self._static_region.sources:
+            # Parse RTL directly for port info
+            from .rtl_parser import RTLParser
+            parser = RTLParser()
+            module_name = self._static_region.design if isinstance(
+                self._static_region.design, str
+            ) else self._static_region.name
+            resolved_sources = self._resolve_sources(self._static_region.sources)
+            try:
+                module_info = parser.parse_module(resolved_sources, module_name)
+                for port_name, port in module_info.ports.items():
+                    if port_name in ('clk', 'rst', 'reset', 'rst_n', 'reset_n'):
+                        continue
+                    static_ports.append({
+                        'name': port_name,
+                        'width': port.width,
+                        'direction': port.direction,
+                    })
+            except Exception as e:
+                logger.warning(f"Could not parse static region RTL for port info: {e}")
+
+        # Store static ports for API generation (used by static region's _generate_api)
+        from .codegen.api_generator import PortSpec
+        self._static_region._static_ports_for_api = [
+            PortSpec(
+                name=p['name'],
+                width=p['width'],
+                direction=p['direction'],
+                index=idx,
+            )
+            for idx, p in enumerate(static_ports)
+        ]
+
+        # Detect clock name: pyslang RTL analysis > config > default 'clk'
+        from .verilator_builder import _detect_clock_from_rtl
+        static_clock = _detect_clock_from_rtl(static_sources, static_design)
+        if static_clock is None:
+            static_clock = self._static_region.clocks[0] if self._static_region.clocks else 'clk'
+
+        self._builder.set_static_region(
+            design_name=static_design,
+            sources=static_sources,
+            ports=static_ports,
+            clock_name=static_clock,
+        )
+
+        # Register partitions
         if self.config is None:
             return
 
-        from .queue_bridge import QueueBridgeGenerator, PartitionBoundary, PartitionBoundaryPort
-
-        queue_dir = Path(self.build_dir).resolve() / 'queues'
-        bridge_gen = QueueBridgeGenerator(
-            build_dir=str(Path(self.build_dir) / 'bridges'),
-            queue_dir=str(queue_dir)
-        )
-
-        for part_cfg in self.config.partitions:
+        for part_idx, part_cfg in enumerate(self.config.partitions):
             if 'boundary' not in part_cfg:
                 continue
 
@@ -551,44 +637,90 @@ class PRSystem:
                     f"Partition '{partition_name}' has boundary but no rm_module specified"
                 )
                 continue
-            ports = []
-            for port_cfg in part_cfg['boundary']:
-                ports.append(PartitionBoundaryPort(
-                    name=port_cfg['name'],
-                    width=port_cfg.get('width', 1),
-                    direction=port_cfg['direction']
-                ))
 
-            boundary = PartitionBoundary(
-                partition_name=partition_name,
-                rm_module_name=rm_module,
-                ports=ports,
-                clock_name=clock_name
-            )
-            bridge_path = bridge_gen.generate_static_side_bridge(
-                boundary=boundary,
-                queue_prefix=partition_name
-            )
-            logger.info(f"Generated static-side bridge for partition '{partition_name}': {bridge_path}")
+            to_rm_ports = []
+            from_rm_ports = []
+            for port_cfg in part_cfg['boundary']:
+                port_dict = {'name': port_cfg['name'], 'width': port_cfg.get('width', 1)}
+                if port_cfg['direction'] == 'to_rm':
+                    to_rm_ports.append(port_dict)
+                else:
+                    from_rm_ports.append(port_dict)
+
+            # Collect RM variants for this partition
             partition = self.partitions.get(partition_name)
+            rm_variants = []
             if partition:
-                partition._boundary_config = boundary
-                partition._bridge_path = bridge_path
-            if self._static_region is not None:
-                self._static_region.sources.append(str(bridge_path))
-                logger.info(f"Added bridge to static region sources: {bridge_path}")
+                for rm_idx, (rm_name, rm) in enumerate(partition.registered_rms.items()):
+                    rm_design = rm.design or rm_name
+                    rm_sources = self._resolve_sources(rm.sources)
+                    rm_variants.append({
+                        'name': rm_name,
+                        'design': rm_design,
+                        'wrapper_name': f"{rm_design}_dpi_wrapper",
+                        'index': rm_idx,
+                        'sources': rm_sources,
+                        'include_dirs': [],
+                    })
+                    # Store the rm_index on the module for later reference
+                    rm._rm_index = rm_idx
+
+            initial_rm_index = 0
+            if partition and partition.initial_rm_name:
+                for i, rm_name in enumerate(partition.registered_rms.keys()):
+                    if rm_name == partition.initial_rm_name:
+                        initial_rm_index = i
+                        break
+
+            self._builder.add_partition(
+                name=partition_name,
+                index=part_idx,
+                rm_module_name=rm_module,
+                clock_name=clock_name,
+                to_rm_ports=to_rm_ports,
+                from_rm_ports=from_rm_ports,
+                rm_variants=rm_variants,
+                initial_rm_index=initial_rm_index,
+            )
+
+            # Store partition index for shared memory targeting
+            if partition:
+                partition._partition_index = part_idx
+
+    def _resolve_sources(self, sources: List[str]) -> List[str]:
+        """Resolve source file paths relative to config or cwd."""
+        resolved = []
+        for source in sources:
+            source_path = Path(source)
+            if source_path.exists():
+                resolved.append(str(source_path.resolve()))
+            elif self.config and self.config._source_path:
+                config_dir = self.config._source_path.parent
+                rel_path = config_dir / source
+                if rel_path.exists():
+                    resolved.append(str(rel_path.resolve()))
+                else:
+                    resolved.append(source)
+            else:
+                resolved.append(source)
+        return resolved
 
     def simulate(
         self,
         initial_rms: Dict[str, str] = None,
         start_delay: float = None
-    ) -> ProcessCollection:
+    ) -> SimulationProcessManager:
         """
-        Start the simulation with initial RMs.
+        Start the multi-process simulation with initial RMs.
 
-        The static region (if defined) starts FIRST and keeps running
-        for the entire simulation. RMs then connect to the static region
-        via partition boundaries.
+        Launches N+1 separate processes:
+        - 1 static binary (persistent)
+        - N RM binaries (one per partition, can be killed/restarted)
+
+        Communication uses mmap'd shared memory:
+        - Python <-> static: command mailbox
+        - static <-> RM: per-partition DPI channels
+        - All processes: barrier for cycle synchronization
 
         Parameters
         ----------
@@ -596,12 +728,12 @@ class PRSystem:
             Mapping of partition name to initial RM name
             Overrides config settings
         start_delay : float, optional
-            Delay before starting
+            Delay before starting (unused in DPI mode)
 
         Returns
         -------
-        ProcessCollection
-            Collection of running processes
+        SimulationProcessManager
+            The running simulation process manager
         """
         if not self._built:
             self.build()
@@ -610,66 +742,64 @@ class PRSystem:
         for part_name, partition in self.partitions.items():
             if part_name not in initial_rms and partition.initial_rm_name:
                 initial_rms[part_name] = partition.initial_rm_name
-        barrier_plusargs = []
-        if self.cycle_accurate:
-            num_procs = (1 if self._static_region is not None else 0) + len(initial_rms)
-            if num_procs < 2:
-                logger.warning(
-                    "cycle_accurate=True but fewer than 2 processes - "
-                    "barrier sync requires static region + at least one RM"
-                )
-            else:
-                barrier_dir = Path(self.build_dir) / 'barrier'
-                barrier_dir.mkdir(parents=True, exist_ok=True)
-                self._barrier_uri = str(barrier_dir / 'cycle_barrier.sync')
 
-                self._barrier = CycleBarrier(
-                    uri=self._barrier_uri,
-                    create=True,
-                    num_processes=num_procs
-                )
-                logger.info(
-                    f"Created cycle barrier for {num_procs} processes: {self._barrier_uri}"
-                )
+        # Build partition configs for the process manager
+        partition_configs = []
+        for part_name, partition in self.partitions.items():
+            part_idx = getattr(partition, '_partition_index', 0)
+            # Count to_rm and from_rm ports from the builder partition info
+            num_to_rm = 0
+            num_from_rm = 0
+            if self._builder:
+                for pi in self._builder._partitions:
+                    if pi.name == part_name:
+                        num_to_rm = len(pi.to_rm_ports)
+                        num_from_rm = len(pi.from_rm_ports)
+                        break
+            partition_configs.append({
+                'name': part_name,
+                'index': part_idx,
+                'num_to_rm': num_to_rm,
+                'num_from_rm': num_from_rm,
+            })
 
-        if self._static_region is not None:
-            if self.cycle_accurate and self._barrier is not None:
-                barrier_plusargs = [
-                    f'barrier_uri={self._barrier_uri}',
-                    'barrier_leader=0',
-                    f'barrier_procs={self._barrier.get_num_processes()}'
-                ]
-            proc = self._static_region.start(
-                start_delay=start_delay or self.start_delay,
-                extra_plusargs=barrier_plusargs
-            )
-            self.process_collection.add(proc)
-            logger.info("Static region started - will keep running during RM swaps")
-
+        # Validate initial RMs
         for partition_name, rm_name in initial_rms.items():
             if partition_name not in self.partitions:
                 raise PRReconfigurationError(
                     f"Unknown partition: '{partition_name}'"
                 )
-            if rm_name not in self.modules:
+            if rm_name not in self.modules and rm_name not in self._rm_binary_map:
                 raise PRReconfigurationError(
                     f"Unknown RM: '{rm_name}'"
                 )
 
-            partition = self.partitions[partition_name]
-            rm = self.modules[rm_name]
-            rm_barrier_plusargs = []
-            if self.cycle_accurate and self._barrier is not None:
-                rm_barrier_plusargs = [
-                    f'barrier_uri={self._barrier_uri}',
-                    'barrier_leader=0',
-                    f'barrier_procs={self._barrier.get_num_processes()}'
-                ]
+        # Start the multi-process simulation
+        static_binary = str(self._binary_paths.get('static', Path(self.build_dir) / 'static_binary'))
 
-            partition.load_rm(rm, extra_plusargs=rm_barrier_plusargs)
+        self._sim_process = SimulationProcessManager(build_dir=self.build_dir)
+        self._sim_process.start(
+            static_binary=static_binary,
+            rm_binaries=self._rm_binary_map,
+            partition_configs=partition_configs,
+            initial_rm_map=initial_rms,
+        )
+
+        # Mark partitions as having their initial RMs loaded
+        for partition_name, rm_name in initial_rms.items():
+            partition = self.partitions[partition_name]
+            rm = self.modules.get(rm_name)
+            if rm:
+                partition.active_rm = rm
 
         self._running = True
-        return self.process_collection
+        if self._static_region:
+            self._static_region._running = True
+        logger.info(
+            f"Simulation started: {1 + len(initial_rms)} processes "
+            f"({len(initial_rms)} partitions)"
+        )
+        return self._sim_process
 
     def reconfigure(
         self,
@@ -680,10 +810,13 @@ class PRSystem:
         """
         Reconfigure a partition with a new RM.
 
-        This is the main reconfiguration API. It follows proper PR phases:
-        1. ISOLATE - Set hardware isolation via static region control
-        2. SWAP - Terminate current RM, start new RM (fresh state)
-        3. RELEASE - Clear hardware isolation
+        In the multi-binary architecture, this:
+        1. Sends CMD_RECONFIG to the static binary via shared memory mailbox
+        2. Static binary sets quit flag on partition channel
+        3. Old RM process sees quit and exits
+        4. New RM binary is started (connects to same partition channel)
+        5. New RM sets rm_ready -> static resumes barrier cycling
+        6. Static sets CMD_NOOP -> Python sees completion
 
         The new RM starts with reset register values - this matches
         real FPGA PR behavior (GSR on Xilinx, manual reset on Intel).
@@ -695,7 +828,7 @@ class PRSystem:
         new_rm : str
             Name of new RM to load
         timeout : float
-            Timeout for graceful termination
+            Timeout for reconfiguration
 
         Returns
         -------
@@ -711,28 +844,38 @@ class PRSystem:
             raise PRReconfigurationError(f"Unknown partition: '{partition}'")
         if new_rm not in self.modules:
             raise PRReconfigurationError(f"Unknown RM: '{new_rm}'")
+        if new_rm not in self._rm_binary_map:
+            raise PRReconfigurationError(
+                f"RM '{new_rm}' has no binary path - was the system built?"
+            )
 
         part = self.partitions[partition]
         rm = self.modules[new_rm]
-        if self._static_region is not None:
-            logger.info(f"Setting hardware isolation for partition '{partition}'")
-            self.set_isolation(partition, isolated=True)
+        old_name = part.active_rm.name if part.active_rm else None
 
         try:
-            result = part.reconfigure(new_rm=rm, timeout=timeout)
-            if self._static_region is not None:
-                logger.info(f"Releasing hardware isolation for partition '{partition}'")
-                self.set_isolation(partition, isolated=False)
+            self._sim_process.reconfigure(
+                partition_name=partition,
+                new_rm_name=new_rm,
+                new_rm_binary=self._rm_binary_map[new_rm],
+                timeout=timeout,
+            )
 
-            return result
+            part.active_rm = rm
+            # Clear cached SHM interface since state is fresh
+            self._shm_interfaces.pop(f'_shm_{partition}', None)
+
+            logger.info(
+                f"Partition '{partition}': reconfigured "
+                f"'{old_name}' -> '{new_rm}'"
+            )
+            return True
 
         except Exception as e:
-            if self._static_region is not None:
-                try:
-                    self.set_isolation(partition, isolated=False)
-                except Exception:
-                    pass
-            raise
+            raise PRReconfigurationError(
+                f"Failed to reconfigure partition '{partition}' "
+                f"to '{new_rm}': {e}"
+            ) from e
 
     def load_greybox(self, partition: str) -> bool:
         """
@@ -761,21 +904,21 @@ class PRSystem:
         """Get reconfigurable module by name."""
         return self.modules.get(name)
 
-    def get_rm_api(self, partition_name: str, umi=None):
+    def get_rm_api(self, partition_name: str, shm=None):
         """
         Get the auto-generated Python API for the currently active RM in a partition.
 
         This is a convenience method that:
         1. Gets the currently active RM in the partition
-        2. Creates a UMI interface to the partition if not provided
+        2. Creates a shared memory interface to the partition if not provided
         3. Returns the RM's auto-generated API
 
         Parameters
         ----------
         partition_name : str
             Name of the partition
-        umi : UmiTxRx, optional
-            UMI interface to use. If not provided, creates one via umi_for_partition()
+        shm : SharedMemoryInterface, optional
+            Shared memory interface. If not provided, creates one via shm_for_partition()
 
         Returns
         -------
@@ -794,8 +937,8 @@ class PRSystem:
         system.build()
         system.simulate()
         api = system.get_rm_api('rp0')
-        api.write_counter(0x12345678)
-        led_state = api.read_led_status()
+        api.write_operand_a(42)
+        result = api.read_result()
         system.reconfigure('rp0', 'new_rm')
         api = system.get_rm_api('rp0')  # Returns API for new RM
         ```
@@ -815,159 +958,99 @@ class PRSystem:
                 f"RM '{active_rm.name}' does not have auto_wrap enabled. "
                 f"Set auto_wrap: true in the RM configuration."
             )
-        if umi is None:
-            umi = self.umi_for_partition(partition_name)
+        if shm is None:
+            shm = self.shm_for_partition(partition_name)
 
-        return active_rm.get_api(umi)
+        return active_rm.get_api(shm)
 
     @property
     def intfs(self) -> Dict:
-        """Get all interface objects for Python interaction."""
-        result = {}
-        if self.static_region and hasattr(self.static_region, 'intfs'):
-            result.update(self.static_region.intfs)
-        for partition in self.partitions.values():
-            result.update(partition.get_intfs())
+        """Get all shared memory interface objects for Python interaction."""
+        return dict(self._shm_interfaces)
 
-        return result
+    def _get_partition_shm(self, partition_name: str, target: int = None) -> SharedMemoryInterface:
+        """Get or create a SharedMemoryInterface for a partition."""
+        cache_key = f'_shm_{partition_name}'
+        if cache_key in self._shm_interfaces:
+            return self._shm_interfaces[cache_key]
 
-    def _get_partition_mapping(self, partition_name: str) -> Optional[Dict]:
+        if self._sim_process is None:
+            raise PRReconfigurationError("Simulation is not running")
+
+        if target is None:
+            partition = self.partitions[partition_name]
+            target = getattr(partition, '_partition_index', 0) + 1
+
+        shm = self._sim_process.get_interface(target=target)
+        self._shm_interfaces[cache_key] = shm
+        return shm
+
+    def shm_for_partition(self, partition_name: str) -> SharedMemoryInterface:
         """
-        Get partition mapping from static region config.
-
-        Returns the mapping dict with keys:
-        - external_req: queue name for external request interface
-        - external_resp: queue name for external response interface
-        - partition_req: queue name for partition request interface
-        - partition_resp: queue name for partition response interface
-        - isolation_bit: bit index in isolation control register
-
-        Returns None if no mapping exists.
-        """
-        if self._static_region is None or self.config is None:
-            return None
-
-        sr_cfg = self.config.static_region
-        if not sr_cfg:
-            return None
-
-        return sr_cfg.get('partition_mapping', {}).get(partition_name)
-
-    def umi_for_partition(self, partition_name: str) -> Any:
-        """
-        Get UMI interface for a partition, routed through static region.
-
-        When a static region is present, traffic flows:
-        Python → Static Region → RM
-
-        The mapping is derived from static_region.interfaces using naming
-        conventions (see config.py:_derive_partition_mapping) or can be
-        explicitly specified in the config.
+        Get shared memory interface for a partition.
 
         Parameters
         ----------
         partition_name : str
-            Name of partition to get UMI for
+            Name of partition to get interface for
 
         Returns
         -------
-        UmiTxRx
-            UMI interface that talks through static region
+        SharedMemoryInterface
+            Interface that talks to the partition via shared memory
         """
         if partition_name not in self.partitions:
             raise PRReconfigurationError(f"Unknown partition: '{partition_name}'")
-        cache_key = f'_umi_{partition_name}'
-        if hasattr(self, cache_key):
-            cached = getattr(self, cache_key)
-            if cached is not None:
-                return cached
 
-        from switchboard import UmiTxRx
-        if self._static_region is not None:
-            mapping = self._get_partition_mapping(partition_name)
-            if mapping:
-                tx_uri = f"{mapping['external_req']}.q"
-                rx_uri = f"{mapping['external_resp']}.q"
-            else:
-                partition = self.partitions[partition_name]
-                tx_uri = partition.get_queue_uri('req')
-                rx_uri = partition.get_queue_uri('resp')
-                logger.debug(
-                    f"No partition mapping for '{partition_name}' - using direct partition queues: "
-                    f"tx={tx_uri}, rx={rx_uri}"
-                )
-        else:
-            partition = self.partitions[partition_name]
-            tx_uri = partition.get_queue_uri('req')
-            rx_uri = partition.get_queue_uri('resp')
+        partition = self.partitions[partition_name]
+        target = getattr(partition, '_partition_index', 0) + 1
+        return self._get_partition_shm(partition_name, target=target)
 
-        umi = UmiTxRx(tx_uri=tx_uri, rx_uri=rx_uri, fresh=False)
-        setattr(self, cache_key, umi)
-        return umi
-
-    def umi_for_static(self) -> Any:
+    def shm_for_static(self) -> SharedMemoryInterface:
         """
-        Get UMI interface for the static region.
-
-        This returns a UmiTxRx interface that can communicate directly with
-        the static region's UMI wrapper. The static region must be started
-        (running) for this to work.
+        Get shared memory interface for the static region.
 
         Returns
         -------
-        UmiTxRx
-            UMI interface that talks to the static region
+        SharedMemoryInterface
+            Interface that talks to the static region via shared memory
 
         Raises
         ------
         PRReconfigurationError
-            If no static region exists, not running, or no UMI interface available
-
-        Example
-        -------
-        ```python
-        system = PRSystem(config='pr_config.yaml')
-        system.build()
-        system.simulate()
-        static_umi = system.umi_for_static()
-        value = static_umi.read(0x0, np.uint32)
-        ```
+            If no static region exists or simulation is not running
         """
         if self._static_region is None:
             raise PRReconfigurationError(
-                "No static region configured - cannot get UMI interface"
+                "No static region configured - cannot get interface"
             )
 
-        if not self._static_region._running:
+        if not self._running:
             raise PRReconfigurationError(
-                "Static region is not running - call simulate() first"
+                "Simulation is not running - call simulate() first"
             )
-        if hasattr(self, '_umi_static') and self._umi_static is not None:
-            return self._umi_static
-        if self._static_region._intfs:
-            for intf_name, intf in self._static_region._intfs.items():
-                if hasattr(intf, 'read') and hasattr(intf, 'write'):
-                    self._umi_static = intf
-                    return intf
-        from switchboard import UmiTxRx
-        tx_uri = 'req.q'
-        rx_uri = 'resp.q'
 
-        self._umi_static = UmiTxRx(tx_uri=tx_uri, rx_uri=rx_uri, fresh=False)
-        return self._umi_static
+        cache_key = '_shm_static'
+        if cache_key in self._shm_interfaces:
+            return self._shm_interfaces[cache_key]
 
-    def get_static_api(self, umi=None):
+        from .shm_interface import TARGET_STATIC
+        shm = self._sim_process.get_interface(target=TARGET_STATIC)
+        self._shm_interfaces[cache_key] = shm
+        return shm
+
+    def get_static_api(self, shm=None):
         """
         Get the auto-generated Python API for the static region.
 
         This is a convenience method that:
-        1. Gets or creates a UMI interface to the static region
+        1. Gets or creates a shared memory interface to the static region
         2. Returns the static region's auto-generated API
 
         Parameters
         ----------
-        umi : UmiTxRx, optional
-            UMI interface to use. If not provided, creates one via umi_for_static()
+        shm : SharedMemoryInterface, optional
+            Shared memory interface. If not provided, creates one via shm_for_static()
 
         Returns
         -------
@@ -1005,47 +1088,31 @@ class PRSystem:
             raise PRReconfigurationError(
                 "Static region is not running - call simulate() first"
             )
-        if umi is None:
-            umi = self.umi_for_static()
+        if shm is None:
+            shm = self.shm_for_static()
 
-        return self._static_region.get_api(umi)
+        return self._static_region.get_api(shm)
 
     @property
-    def ctrl_umi(self) -> Any:
+    def ctrl_shm(self) -> SharedMemoryInterface:
         """
-        Get UMI interface for static region control (isolation control).
-
-        Write to address 0x0 to set isolation bits:
-        - Bit 0: rp0 isolation
-        - Bit 1: rp1 isolation (if present)
+        Get shared memory interface for static region control.
 
         Returns
         -------
-        UmiTxRx
-            UMI interface for control
+        SharedMemoryInterface
+            Interface for control (same as shm_for_static)
         """
-        if self._ctrl_umi is None:
-            if self._static_region is None:
-                raise PRReconfigurationError(
-                    "No static region - cannot get control interface"
-                )
-
-            from switchboard import UmiTxRx
-            self._ctrl_umi = UmiTxRx(
-                tx_uri='ctrl_req.q',
-                rx_uri='ctrl_resp.q',
-                fresh=False
-            )
-
-        return self._ctrl_umi
+        return self.shm_for_static()
 
     def set_isolation(self, partition_name: str, isolated: bool):
         """
-        Set isolation state for a partition via static region control.
+        Set isolation state for a partition.
 
-        The isolation bit index is derived from the partition mapping in config,
-        which is auto-generated by config.py:_derive_partition_mapping() or
-        can be explicitly specified.
+        In DPI mode, isolation is managed implicitly by the single-process
+        architecture. During reconfiguration, the RM thread stays alive
+        (just swaps the model), so there's no need for explicit isolation
+        control. This method is kept for API compatibility.
 
         Parameters
         ----------
@@ -1054,48 +1121,25 @@ class PRSystem:
         isolated : bool
             True to isolate, False to release
         """
-        import numpy as np
-
-        if self._static_region is None:
-            logger.warning("No static region - isolation is software-only")
-            return
-        partition = self.partitions.get(partition_name)
-        if partition and hasattr(partition, '_boundary_config') and partition._boundary_config:
-            logger.debug(
-                f"Partition '{partition_name}' uses queue-based boundary - "
-                f"isolation handled by queue management"
-            )
-            return
-        mapping = self._get_partition_mapping(partition_name)
-        if not mapping:
-            logger.warning(
-                f"No partition mapping for '{partition_name}' - cannot set isolation. "
-                f"Ensure static_region.interfaces follows naming convention or "
-                f"explicitly define partition_mapping in config."
-            )
-            return
-
-        bit_idx = mapping.get('isolation_bit')
-        if bit_idx is None:
-            logger.warning(f"No isolation_bit defined for partition '{partition_name}'")
-            return
-        ctrl = self.ctrl_umi
-        current = ctrl.read(0x0, np.uint32)
-        bit_mask = np.uint32(1 << bit_idx)
-        if isolated:
-            new_val = current | bit_mask
-        else:
-            new_val = current & ~bit_mask  # ~uint32 stays in 32-bit space
-        ctrl.write(0x0, np.uint32(new_val))
-        logger.debug(f"Set isolation for {partition_name}: {isolated} (bit {bit_idx}, bits: {new_val:#x})")
+        logger.debug(
+            f"Isolation {'set' if isolated else 'released'} for {partition_name} "
+            f"(handled implicitly in DPI mode)"
+        )
 
     def terminate(self, timeout: float = 10.0):
-        """Terminate all simulations."""
-        for partition in self.partitions.values():
-            partition.terminate(timeout=timeout)
-        if self._static_region is not None:
-            self._static_region.terminate(timeout=timeout)
-        self.process_collection.terminate(stop_timeout=timeout)
+        """Terminate the simulation."""
+        # Close cached shared memory interfaces
+        for key, shm in list(self._shm_interfaces.items()):
+            try:
+                shm.close()
+            except Exception:
+                pass
+        self._shm_interfaces.clear()
+
+        # Terminate simulation process
+        if self._sim_process is not None:
+            self._sim_process.terminate(timeout=timeout)
+            self._sim_process = None
 
         # Close barrier if present
         if self._barrier is not None:
@@ -1104,11 +1148,12 @@ class PRSystem:
             self._barrier_uri = None
 
         self._running = False
-        logger.info("All simulations terminated")
+        logger.info("Simulation terminated")
 
     def wait(self, timeout: float = None):
-        """Wait for all simulations to complete."""
-        self.process_collection.wait()
+        """Wait for simulation to complete."""
+        if self._sim_process is not None:
+            self._sim_process.wait(timeout=timeout)
 
     @property
     def is_running(self) -> bool:

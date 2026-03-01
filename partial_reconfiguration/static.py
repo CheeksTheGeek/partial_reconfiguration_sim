@@ -9,7 +9,6 @@ from .exceptions import PRBuildError, PRConfigError
 if TYPE_CHECKING:
     from .system import PRSystem
     from .partition import Partition
-    from .wrapper_generator import WrapperOutput
 
 logger = logging.getLogger(__name__)
 
@@ -25,14 +24,14 @@ class StaticRegion:
     - Provides clocks, resets, and infrastructure to RMs
 
     In simulation:
-    - This is a single SbDut/Verilator process that never stops
-    - It connects to partition queues for communication
-    - It can receive isolation signals from Python
-    - RMs connect to the other end of the partition queues
+    - This is the static Verilator process that runs continuously
+    - It communicates with RM processes via shared memory + DPI-C bridges
+    - It can receive isolation signals from Python via the mailbox
+    - Each RM runs as a separate Verilator process sharing the same memory region
 
     Architecture:
     ```
-    StaticRegion (persistent SbDut)
+    StaticRegion (persistent Verilator process)
         ├── clk, rst_n
         ├── Partition rp0 boundary
         │   ├── to_rp0_* (outputs to RM)
@@ -83,18 +82,10 @@ class StaticRegion:
         build_dir : str
             Build directory
         auto_wrap : bool
-            If True, parse RTL and auto-generate UMI wrapper.
-            This allows Python to read/write static region signals
-            via the generated API.
+            If True, generate a Python API for reading/writing
+            static region signals via shared memory interface.
         auto_wrap_config : dict
-            Configuration for wrapper generation. Supported keys:
-            - enable_read_back: bool (default True)
-            - enable_interrupts: bool (default True)
-            - address_width: int (default 16)
-            - register_width: int (default 32)
-            - clock_name: str (default 'clk')
-            - reset_name: str (default 'rst_n')
-            - reset_active_low: bool (default True)
+            Configuration for API generation (reserved for future use).
         ports_override : dict, optional
             Explicit port definitions to use instead of RTL parsing.
             Format: {port_name: {direction: 'input'|'output', width: N, type: 'clock'|'reset'|'data'}}
@@ -118,9 +109,9 @@ class StaticRegion:
         self._running = False
         self._boundaries: Dict[str, PartitionBoundary] = {}
         self._intfs: Dict[str, Any] = {}
-        self._wrapper_output: Optional['WrapperOutput'] = None
         self._module_info = None
         self._api_class = None
+        self._static_ports_for_api = None  # Set by system._setup_builder()
 
     def add_partition_boundary(
         self,
@@ -154,120 +145,26 @@ class StaticRegion:
         return self._boundaries.get(partition_name)
 
     def _create_dut(self):
-        """Create the SbDut for the static region."""
-        if self._dut is not None:
-            return self._dut
+        """
+        Placeholder for backward compatibility.
 
-        from switchboard import SbDut
-        from siliconcompiler import Design
-        tool = 'verilator'
-        trace = False
-        trace_type = 'vcd'
-        frequency = 100e6
-        max_rate = -1
-
-        if self.system:
-            tool = self.system.tool
-            trace = self.system.trace
-            trace_type = self.system.trace_type
-            frequency = self.system.frequency
-            max_rate = self.system.max_rate
-        design_obj = None
-        if self.sources:
-            design_name = self.design if isinstance(self.design, str) else self.name
-            design_obj = Design(design_name)
-
-            with design_obj.active_fileset('rtl'):
-                design_obj.set_topmodule(design_name)
-                for source in self.sources:
-                    source_path = Path(source)
-                    if source_path.exists():
-                        design_obj.add_file(str(source_path))
-                    elif self.system and self.system.config and self.system.config._source_path:
-                        config_dir = self.system.config._source_path.parent
-                        rel_path = config_dir / source
-                        if rel_path.exists():
-                            design_obj.add_file(str(rel_path))
-                        else:
-                            design_obj.add_file(source)
-                    else:
-                        design_obj.add_file(source)
-
-            with design_obj.active_fileset('verilator'):
-                design_obj.set_topmodule(design_name)
-                design_obj.add_depfileset(design_obj, 'rtl')
-
-            with design_obj.active_fileset('icarus'):
-                design_obj.set_topmodule(design_name)
-                design_obj.add_depfileset(design_obj, 'rtl')
-
-        elif self.design:
-            design_obj = self.design
-
-        if design_obj is None:
-            raise PRConfigError(
-                f"Static region '{self.name}' has no design or sources. "
-                "A static region requires RTL to simulate."
-            )
-        interfaces = self.interfaces.copy() if self.interfaces else {}
-        if self.auto_wrap and self._wrapper_output:
-            umi_dw = self.auto_wrap_config.get('umi_dw', 256)
-            umi_aw = self.auto_wrap_config.get('umi_aw', 64)
-            umi_cw = self.auto_wrap_config.get('umi_cw', 32)
-            interfaces['req'] = {
-                'type': 'umi',
-                'dw': umi_dw,
-                'aw': umi_aw,
-                'cw': umi_cw,
-                'direction': 'input',
-                'txrx': 'umi'
-            }
-            interfaces['resp'] = {
-                'type': 'umi',
-                'dw': umi_dw,
-                'aw': umi_aw,
-                'cw': umi_cw,
-                'direction': 'output',
-                'txrx': 'umi'
-            }
-            logger.info(f"Added UMI interfaces for auto-wrapped static region: dw={umi_dw}, aw={umi_aw}, cw={umi_cw}")
-
-        cycle_sync = False
-        if self.system and hasattr(self.system, 'cycle_accurate'):
-            cycle_sync = self.system.cycle_accurate
-
-        self._dut = SbDut(
-            design=design_obj,
-            tool=tool,
-            trace=trace,
-            trace_type=trace_type,
-            frequency=frequency,
-            max_rate=max_rate,
-            autowrap=True,
-            parameters=self.parameters,
-            interfaces=interfaces,
-            clocks=self.clocks,
-            resets=self.resets,
-            builddir=self.build_dir,
-            cycle_sync=cycle_sync
-        )
-
-        return self._dut
+        In DPI mode, builds are handled centrally by VerilatorBuilder
+        via PRSystem.build(). The static region doesn't build independently.
+        """
+        return None
 
     def build(self, fast: bool = False) -> 'StaticRegion':
         """
-        Build the static region simulation.
+        Build the static region artifacts.
 
-        If auto_wrap is enabled, this will:
-        1. Parse RTL sources to extract port definitions
-        2. Generate UMI wrapper RTL
-        3. Generate Python API, C headers, and JSON address map
-        4. Build the wrapper (which includes the original module)
+        In DPI mode, the actual compilation is handled centrally by
+        VerilatorBuilder via PRSystem.build(). This method generates
+        the Python API if auto_wrap is enabled.
 
         Parameters
         ----------
         fast : bool
-            Skip rebuild if binary exists
+            Skip rebuild if artifacts exist
 
         Returns
         -------
@@ -275,128 +172,128 @@ class StaticRegion:
             Self for method chaining
         """
         try:
-            if self.auto_wrap and not self._wrapper_output:
-                self._generate_auto_wrap()
+            if self.auto_wrap and self._api_class is None:
+                self._generate_api()
 
-            dut = self._create_dut()
-            dut.build(fast=fast)
             self._built = True
-            logger.info(f"Static region '{self.name}' built successfully")
+            logger.info(f"Static region '{self.name}' artifacts ready")
         except Exception as e:
             raise PRBuildError(f"Failed to build static region '{self.name}': {e}") from e
 
         return self
 
-    def _generate_auto_wrap(self):
+    def _generate_api(self):
         """
-        Parse RTL and generate UMI wrapper for the static region.
+        Generate Python API for the static region using port-index access.
 
-        This parses the RTL sources to extract port definitions,
-        then generates:
-        - UMI wrapper RTL (wrapper instantiates original module)
-        - Python API module
-        - C header file
-        - JSON address map
+        Uses pyslang to parse RTL directly (or ports_override if provided)
+        to get port definitions, then generates a Python API class with
+        read_port/write_port methods.
 
-        If ports_override is provided, RTL parsing is skipped and the
-        explicit port definitions are used directly.
+        Does NOT modify self.design or self.sources.
         """
-        from .rtl_parser import RTLParser, ModuleInfo, PortInfo
-        from .wrapper_generator import UMIWrapperGenerator, WrapperConfig
+        from .codegen.api_generator import ApiGenerator, PortSpec
 
         module_name = self.design if isinstance(self.design, str) else self.name
-        if self.ports_override:
+
+        # Get ports: prefer _static_ports_for_api (set by system._setup_builder),
+        # then ports_override, then pyslang parsing
+        if self._static_ports_for_api is not None:
+            port_specs = self._static_ports_for_api
+        elif self.ports_override:
             logger.info(f"Using explicit ports override for static region: {self.name}")
-            self._module_info = self._create_module_info_from_override(module_name)
+            port_specs = []
+            idx = 0
+            for port_name, port_def in self.ports_override.items():
+                ptype = port_def.get('type', 'data')
+                if ptype in ('clock', 'reset'):
+                    continue
+                port_specs.append(PortSpec(
+                    name=port_name,
+                    width=port_def.get('width', 1),
+                    direction=port_def.get('direction', 'input'),
+                    index=idx,
+                ))
+                idx += 1
         else:
-            if not self.sources:
-                raise PRBuildError(
-                    f"Static region '{self.name}' has auto_wrap=True but no sources specified "
-                    f"and no ports_override provided"
-                )
-            resolved_sources = []
-            for source in self.sources:
-                source_path = Path(source)
-                if source_path.exists():
-                    resolved_sources.append(str(source_path.resolve()))
-                elif self.system and self.system.config and self.system.config._source_path:
-                    config_dir = self.system.config._source_path.parent
-                    rel_path = config_dir / source
-                    if rel_path.exists():
-                        resolved_sources.append(str(rel_path.resolve()))
-                    else:
-                        raise PRBuildError(f"Source file not found: {source}")
-                else:
-                    raise PRBuildError(f"Source file not found: {source}")
+            port_specs = self._parse_ports_with_pyslang(module_name)
 
-            logger.info(f"Parsing RTL for static region auto-wrap: {self.name}")
-            parser = RTLParser()
-            try:
-                self._module_info = parser.parse_module(resolved_sources, module_name)
-            except Exception as e:
-                raise PRBuildError(f"Failed to parse RTL for static region '{self.name}': {e}") from e
-            warnings = parser.validate_ports(self._module_info)
-            for warning in warnings:
-                logger.warning(f"[{self.name}] {warning}")
-        clock_name = self.auto_wrap_config.get('clock_name', 'clk')
-        if self.clocks:
-            clock_name = self.clocks[0]
+        generator = ApiGenerator()
+        class_name = generator._class_name_from(module_name)
+        self._api_class = generator.generate_api_class(class_name, module_name, port_specs)
+        logger.info(f"Generated API for static region '{self.name}': {len(port_specs)} ports")
 
-        config = WrapperConfig(
-            enable_read_back=self.auto_wrap_config.get('enable_read_back', True),
-            enable_interrupts=self.auto_wrap_config.get('enable_interrupts', True),
-            enable_wide_burst=self.auto_wrap_config.get('enable_wide_burst', True),
-            enable_inout=self.auto_wrap_config.get('enable_inout', True),
-            address_width=self.auto_wrap_config.get('address_width', 16),
-            register_width=self.auto_wrap_config.get('register_width', 32),
-            clock_name=clock_name,
-        )
-        logger.info(f"Generating UMI wrapper for static region: {self.name}")
-        generator = UMIWrapperGenerator(config)
-        self._wrapper_output = generator.generate(self._module_info)
+    def _parse_ports_with_pyslang(self, module_name: str):
+        """Parse RTL with pyslang and return list of PortSpec."""
+        from .codegen.api_generator import PortSpec
 
-        if not self._wrapper_output.is_valid:
-            for error in self._wrapper_output.validation_errors:
-                logger.error(f"[{self.name}] {error}")
+        if not self.sources:
             raise PRBuildError(
-                f"Auto-wrap validation failed for static region '{self.name}': "
-                f"{len(self._wrapper_output.validation_errors)} errors"
+                f"Static region '{self.name}' has auto_wrap=True but no sources specified "
+                f"and no ports_override provided"
             )
 
-        for warning in self._wrapper_output.validation_warnings:
-            logger.warning(f"[{self.name}] {warning}")
-        build_dir = Path(self.build_dir)
-        build_dir.mkdir(parents=True, exist_ok=True)
+        resolved_sources = self._resolve_sources()
 
-        wrapper_path = build_dir / f"{self._wrapper_output.wrapper_name}.sv"
-        wrapper_path.write_text(self._wrapper_output.wrapper_rtl)
-        logger.info(f"Wrote wrapper RTL: {wrapper_path}")
+        import pyslang
 
-        api_path = build_dir / f"{self._module_info.name}_api.py"
-        api_path.write_text(self._wrapper_output.python_module_code)
-        logger.info(f"Wrote Python API: {api_path}")
+        # Read all source files
+        rtl_texts = []
+        for src in resolved_sources:
+            rtl_texts.append(Path(src).read_text())
+        combined = '\n'.join(rtl_texts)
 
-        header_path = build_dir / f"{self._module_info.name}_regs.h"
-        header_path.write_text(self._wrapper_output.c_header_code)
-        logger.info(f"Wrote C header: {header_path}")
+        tree = pyslang.SyntaxTree.fromText(combined)
+        comp = pyslang.Compilation()
+        comp.addSyntaxTree(tree)
+        comp.getAllDiagnostics()  # triggers elaboration
 
-        json_path = build_dir / f"{self._module_info.name}_regs.json"
-        json_path.write_text(self._wrapper_output.json_address_map)
-        logger.info(f"Wrote JSON address map: {json_path}")
-        self.sources = [str(wrapper_path)] + resolved_sources
-        self.design = self._wrapper_output.wrapper_name
+        clk_rst_names = {'clk', 'rst', 'reset', 'rst_n', 'reset_n'}
+        port_specs = []
+        idx = 0
 
-        logger.info(f"Auto-wrap complete for static region '{self.name}': {len(self._module_info.ports)} ports mapped")
+        for inst in comp.getRoot().topInstances:
+            if inst.name != module_name:
+                continue
+            for member in inst.body:
+                if member.kind != pyslang.SymbolKind.Port:
+                    continue
+                if member.name in clk_rst_names:
+                    continue
+                direction = 'input' if 'In' in str(member.direction) else 'output'
+                width = member.internalSymbol.type.bitWidth
+                port_specs.append(PortSpec(
+                    name=member.name,
+                    width=width,
+                    direction=direction,
+                    index=idx,
+                ))
+                idx += 1
+            break
+
+        return port_specs
+
+    def _resolve_sources(self) -> List[str]:
+        """Resolve source file paths."""
+        resolved = []
+        for source in self.sources:
+            source_path = Path(source)
+            if source_path.exists():
+                resolved.append(str(source_path.resolve()))
+            elif self.system and self.system.config and self.system.config._source_path:
+                config_dir = self.system.config._source_path.parent
+                rel_path = config_dir / source
+                if rel_path.exists():
+                    resolved.append(str(rel_path.resolve()))
+                else:
+                    raise PRBuildError(f"Source file not found: {source}")
+            else:
+                raise PRBuildError(f"Source file not found: {source}")
+        return resolved
 
     def _create_module_info_from_override(self, module_name: str):
         """
         Create ModuleInfo from explicit ports_override configuration.
-
-        This allows users to specify port definitions in YAML config instead of
-        relying on pyslang RTL parsing. Useful when:
-        - pyslang cannot parse the RTL (unsupported constructs)
-        - User wants to exclude certain ports from wrapping
-        - User wants to override inferred port types
 
         Parameters
         ----------
@@ -429,18 +326,14 @@ class StaticRegion:
 
         return ModuleInfo(name=module_name, ports=ports)
 
-    def get_api(self, umi=None):
+    def get_api(self, shm=None):
         """
         Get the auto-generated Python API for this static region.
 
-        This method returns an API class that provides typed read/write
-        methods for all accessible registers, using the original port names.
-
         Parameters
         ----------
-        umi : UmiTxRx, optional
-            UMI interface to use. If not provided, will try to get from
-            the static region's interfaces.
+        shm : SharedMemoryInterface, optional
+            Shared memory interface to use.
 
         Returns
         -------
@@ -451,9 +344,8 @@ class StaticRegion:
         -------
         ```python
         static = system.static_region
-        api = static.get_api()
+        api = static.get_api(shm)
         counter = api.read_count()
-        led_status = api.read_led_zero_on()
         ```
         """
         if not self.auto_wrap:
@@ -462,123 +354,59 @@ class StaticRegion:
             )
             return None
 
-        if self._wrapper_output is None:
+        if self._api_class is None:
             raise PRBuildError(
                 f"Static region '{self.name}' has not been built yet. Call build() first."
             )
-        if umi is None:
-            if self._intfs:
-                for intf_name, intf in self._intfs.items():
-                    if hasattr(intf, 'read') and hasattr(intf, 'write'):
-                        umi = intf
-                        break
 
-            if umi is None:
-                raise ValueError(
-                    f"No UMI interface provided and could not find one for static region '{self.name}'"
-                )
-        if self._api_class is None:
-            import importlib.util
-            import sys
-
-            build_dir = Path(self.build_dir)
-            api_path = build_dir / f"{self._module_info.name}_api.py"
-
-            if not api_path.exists():
-                raise PRBuildError(f"API file not found: {api_path}")
-            module_name = f"generated_api_static_{self.name}"
-            spec = importlib.util.spec_from_file_location(module_name, api_path)
-            module = importlib.util.module_from_spec(spec)
-            sys.modules[module_name] = module
-            spec.loader.exec_module(module)
-            self._api_class = getattr(module, self._wrapper_output.python_class_name)
-        return self._api_class(umi)
-
-    @property
-    def wrapper_output(self) -> Optional['WrapperOutput']:
-        """Get the wrapper output if auto_wrap was used."""
-        return self._wrapper_output
-
-    @property
-    def address_map(self):
-        """Get the address map if auto_wrap was used."""
-        if self._wrapper_output:
-            return self._wrapper_output.address_map
-        return None
+        return self._api_class(shm)
 
     def start(
         self,
         start_delay: float = None,
         extra_plusargs: List[str] = None
-    ) -> subprocess.Popen:
+    ) -> Optional[subprocess.Popen]:
         """
-        Start the static region simulation.
+        Mark the static region as started.
 
-        This starts a long-running Verilator process that will persist
-        for the entire PR simulation session. Unlike RMs, the static
-        region is NEVER stopped during normal operation.
+        In DPI mode, the static region runs as a thread inside the single
+        simulation binary managed by SimulationProcessManager. This method just
+        marks the static region as running.
 
         Parameters
         ----------
         start_delay : float, optional
-            Delay before starting
+            Unused in DPI mode.
         extra_plusargs : list, optional
-            Additional plusargs to pass to the simulator.
-            Used for barrier synchronization in cycle-accurate mode.
+            Unused in DPI mode.
 
         Returns
         -------
-        subprocess.Popen
-            Running process handle
+        None
+            No separate process in DPI mode.
         """
         if not self._built:
             self.build()
 
-        dut = self._dut
-
-        try:
-            self._process = dut.simulate(
-                start_delay=start_delay,
-                plusargs=extra_plusargs or [],
-                intf_objs=True  # Static region owns interface objects
-            )
-            self._running = True
-            self._intfs = dut.intfs
-
-            logger.info(f"Static region '{self.name}' started (PID: {self._process.pid})")
-
-        except Exception as e:
-            raise PRBuildError(
-                f"Failed to start static region '{self.name}': {e}"
-            ) from e
-
-        return self._process
+        self._running = True
+        logger.info(f"Static region '{self.name}' marked as started (DPI mode)")
+        return None
 
     def terminate(self, timeout: float = 10.0):
         """
-        Terminate the static region.
+        Mark the static region as terminated.
 
-        This should only be called at the END of simulation.
-        During normal PR operation, the static region keeps running.
+        In DPI mode, the static region thread lifecycle is managed
+        by the C++ driver.
 
         Parameters
         ----------
         timeout : float
-            Timeout for graceful termination
+            Unused in DPI mode.
         """
-        if self._dut is not None:
-            self._dut.terminate(stop_timeout=timeout)
-
-        if self._process is not None:
-            try:
-                self._process.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                self._process.kill()
-                self._process.wait()
-            self._process = None
-
+        self._process = None
         self._running = False
-        logger.info(f"Static region '{self.name}' terminated")
+        logger.info(f"Static region '{self.name}' marked as terminated (DPI mode)")
 
     def isolate_partition(self, partition_name: str):
         """
@@ -614,10 +442,14 @@ class StaticRegion:
 
     @property
     def is_running(self) -> bool:
-        """Check if static region is running."""
-        if self._process is None:
-            return False
-        return self._process.poll() is None
+        """Check if static region is running.
+
+        In multi-binary mode, checks the system's process manager.
+        Falls back to the _running flag if no process manager.
+        """
+        if self.system and hasattr(self.system, '_sim_process') and self.system._sim_process:
+            return self.system._sim_process.is_running
+        return self._running
 
     @property
     def is_built(self) -> bool:

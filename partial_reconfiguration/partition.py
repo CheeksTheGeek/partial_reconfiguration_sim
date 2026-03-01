@@ -18,18 +18,17 @@ class Partition:
 
     A partition:
     - Defines the interface (ports) between static region and RMs
-    - Owns queue URIs that remain constant across RM swaps
     - Manages which RM is currently loaded
     - Supports greybox modules for testing
 
-    Key insight: When we swap RMs, the queues persist but the process
-    changes. The new process connects to the same queues, enabling
-    seamless communication transition.
+    Key insight: When we swap RMs, the shared memory channel persists
+    but the RM process changes. The new process connects to the same
+    shared memory region, enabling seamless communication transition.
 
     Thread Safety
     -------------
     This class is NOT thread-safe. All operations (load_rm, reconfigure,
-    umi access) should be called from a single thread. If you need
+    shm access) should be called from a single thread. If you need
     concurrent access, implement external synchronization.
     """
 
@@ -71,44 +70,13 @@ class Partition:
         self.registered_rms: Dict[str, 'ReconfigurableModule'] = {}
         self.active_rm: Optional['ReconfigurableModule'] = None
         self._greybox_rm: Optional['ReconfigurableModule'] = None
-        self._queue_uris: Dict[str, str] = {}
-        self._generate_queue_uris()
         self._intfs: Dict[str, Any] = {}
-        self._umi = None
+        self._shm = None
         self._boundary = PartitionBoundary(partition_name=name)
         self._reconfig_controller = ReconfigurationController(
             partition=self,
             reset_behavior=reset_behavior
         )
-
-    def _generate_queue_uris(self):
-        """Generate unique queue URIs for partition ports.
-
-        Uses absolute paths in a shared queue directory so that Python
-        and Verilator processes can find the same queue files regardless
-        of their working directory.
-        """
-        from pathlib import Path
-
-        if self.system and self.system.build_dir:
-            queue_dir = Path(self.system.build_dir).resolve() / 'queues'
-            queue_dir.mkdir(parents=True, exist_ok=True)
-        else:
-            queue_dir = Path.cwd() / 'build' / 'queues'
-            queue_dir.mkdir(parents=True, exist_ok=True)
-
-        for port_name, port_def in self.interface.items():
-            port_type = port_def.get('type', 'sb')
-            direction = port_def.get('direction', 'input')
-
-            if port_type in ['umi', 'sb']:
-                self._queue_uris[port_name] = str(queue_dir / f"{self.name}_{port_name}.q")
-            elif port_type in ['axi', 'axil', 'apb']:
-                self._queue_uris[port_name] = str(queue_dir / f"{self.name}_{port_name}")
-            elif port_type == 'gpio':
-                self._queue_uris[port_name] = str(queue_dir / f"{self.name}_{port_name}_gpio.q")
-            else:
-                self._queue_uris[port_name] = str(queue_dir / f"{self.name}_{port_name}.q")
 
     def register_rm(self, rm: 'ReconfigurableModule'):
         """
@@ -131,14 +99,6 @@ class Partition:
             )
 
         self.registered_rms[rm.name] = rm
-
-    def get_queue_uri(self, port_name: str) -> Optional[str]:
-        """Get queue URI for a partition port."""
-        return self._queue_uris.get(port_name)
-
-    def get_all_queue_uris(self) -> Dict[str, str]:
-        """Get all queue URIs for this partition."""
-        return dict(self._queue_uris)
 
     def create_greybox(self) -> 'ReconfigurableModule':
         """
@@ -233,10 +193,6 @@ class Partition:
         if self.active_rm is not None:
             self.unload_rm()
 
-        rm.configure_queues(self._queue_uris)
-
-        rm.start(extra_plusargs=extra_plusargs)
-
         self.active_rm = rm
         return True
 
@@ -308,12 +264,25 @@ class Partition:
 
         def do_swap():
             """The actual swap operation."""
-            if self.active_rm is not None:
-                self.active_rm.terminate(timeout=timeout)
-
-            new_rm.configure_queues(self._queue_uris)
-
-            new_rm.start()
+            # In multi-binary mode, reconfiguration is handled by the
+            # SimulationProcessManager: kills old RM process, starts
+            # new RM binary, barrier count stays constant.
+            if self.system and hasattr(self.system, '_sim_process') and self.system._sim_process:
+                sim = self.system._sim_process
+                if hasattr(new_rm, '_binary_path') and new_rm._binary_path:
+                    sim.reconfigure(
+                        partition_name=self.name,
+                        new_rm_name=new_rm.name,
+                        new_rm_binary=new_rm._binary_path,
+                        timeout=timeout,
+                    )
+                elif hasattr(self.system, '_rm_binary_map') and new_rm.name in self.system._rm_binary_map:
+                    sim.reconfigure(
+                        partition_name=self.name,
+                        new_rm_name=new_rm.name,
+                        new_rm_binary=self.system._rm_binary_map[new_rm.name],
+                        timeout=timeout,
+                    )
 
             self.active_rm = new_rm
 
@@ -436,73 +405,32 @@ class Partition:
             )
 
     @property
-    def umi(self) -> Any:
+    def shm(self) -> Any:
         """
-        Lazy UMI interface - persists across RM swaps.
+        Get shared memory interface for this partition.
 
-        This is the key to elegant PR simulation: Python's connection to the
-        queue files is independent of which RM process is running. When you
-        swap RMs, the queues persist and Python keeps reading/writing the
-        same files.
+        Returns a SharedMemoryInterface that communicates with the
+        simulation binary via shared memory mailbox.
 
-        IMPORTANT: The queue files must be deleted BEFORE this is called.
-        Use PRSystem as a context manager to ensure correct lifecycle:
-
-            with PRSystem(config=...) as system:
-                system.load('rp0', 'counter_rm')
-                umi = system.partitions['rp0'].umi  # Safe - queues pre-deleted
+        Returns
+        -------
+        SharedMemoryInterface
+            Interface for reading/writing partition signals
 
         Raises
         ------
         PRValidationError
-            If no UMI ports found or invalid configuration
+            If system is not available or simulation not running
         """
-        if self._umi is None:
-            from switchboard import UmiTxRx
-
-            tx_uri = None
-            rx_uri = None
-
-            umi_ports_found = False
-            for port_name, port_def in self.interface.items():
-                port_type = port_def.get('type', 'umi')
-                if port_type != 'umi':
-                    continue
-
-                umi_ports_found = True
-                uri = self._queue_uris[port_name]
-                direction = self._normalize_direction(port_def.get('direction'))
-
-                if direction == 'input':
-                    if tx_uri is not None:
-                        raise PRValidationError(
-                            f"Multiple input UMI ports found: already have tx, "
-                            f"now found '{port_name}'"
-                        )
-                    tx_uri = uri
-                else:
-                    if rx_uri is not None:
-                        raise PRValidationError(
-                            f"Multiple output UMI ports found: already have rx, "
-                            f"now found '{port_name}'"
-                        )
-                    rx_uri = uri
-
-            if not umi_ports_found:
+        if self._shm is None:
+            if self.system is None:
                 raise PRValidationError(
-                    f"No UMI ports found in partition '{self.name}' interface. "
-                    f"Available ports: {list(self.interface.keys())}"
+                    f"Cannot get interface for partition '{self.name}': no system reference"
                 )
+            self._shm = self.system.shm_for_partition(self.name)
+            self._intfs['shm'] = self._shm
 
-            if tx_uri is None and rx_uri is None:
-                raise PRValidationError(
-                    f"No valid UMI ports configured in partition '{self.name}'"
-                )
-
-            self._umi = UmiTxRx(tx_uri=tx_uri, rx_uri=rx_uri, fresh=False)
-            self._intfs['umi'] = self._umi
-
-        return self._umi
+        return self._shm
 
     @property
     def is_loaded(self) -> bool:
