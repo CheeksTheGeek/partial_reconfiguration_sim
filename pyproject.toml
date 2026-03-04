@@ -8,6 +8,7 @@ dependencies = [
     "pyslang >= 7.0.0",
     "numpy",
     "pyyaml",
+    "pyslang-dev>=10.0.0.dev20260218",
 ]
 
 [project.optional-dependencies]
@@ -24,3 +25,8 @@ packages = ["partial_reconfiguration", "partial_reconfiguration.codegen"]
 
 [tool.setuptools.package-data]
 "*" = ["*.sv", "*.v", "*.vh", "*.svh"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]

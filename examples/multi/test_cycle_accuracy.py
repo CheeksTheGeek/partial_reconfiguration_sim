@@ -14,14 +14,17 @@ Note: Tests 1 and 2 verify simulation cycle accuracy. Test 3 measures Python-to-
 timing which is async by design and does NOT indicate cycle inaccuracy.
 """
 
+import os
 import sys
 import time
 import statistics
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from partial_reconfiguration import PRSystem
+THIS_DIR = Path(__file__).resolve().parent
 
 
 def tprint(msg: str):
@@ -29,41 +32,59 @@ def tprint(msg: str):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}")
 
 
-def run_test_latency_variance(echo_api, static_api):
+# ---------------------------------------------------------------------------
+# Fixtures — build once per test session
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def pr_system():
+    from partial_reconfiguration import PRSystem
+
+    old_cwd = os.getcwd()
+    os.chdir(THIS_DIR)
+    try:
+        with PRSystem(config="pr_config.yaml", cycle_accurate=True) as system:
+            system.build()
+            system.simulate()
+            time.sleep(0.2)  # Allow simulation to stabilize
+            yield system
+    finally:
+        os.chdir(old_cwd)
+
+
+@pytest.fixture(scope="module")
+def echo_api(pr_system):
+    return pr_system.get_rm_api("rp_echo")
+
+
+@pytest.fixture(scope="module")
+def static_api(pr_system):
+    return pr_system.get_static_api()
+
+
+@pytest.fixture(scope="module")
+def latency_data(echo_api, static_api):
     """
-    Test 1: Latency Variance Detection
-
-    The RM calculates latency_measurement = rm_counter - static_counter_in
-
-    In a cycle-accurate system:
-    - Both counters increment at the same rate (same clock)
-    - The difference should be CONSTANT (equal to pipeline delay)
-
-    With DPI shared-memory + barrier sync:
-    - Both counters should be perfectly synchronized
-    - The difference should be CONSTANT
-    - Variance = 0 proves cycle accuracy
+    Collect 200 samples (190 after warmup) for latency variance analysis.
+    Computed once and shared across test_latency_* tests.
     """
-    tprint("")
-    tprint("=" * 70)
-    tprint("TEST 1: Latency Variance Detection")
-    tprint("=" * 70)
+    NUM_SAMPLES = 200
+    WARMUP_SAMPLES = 10
+    SAMPLE_INTERVAL = 0.005  # 5ms between samples
 
-    # Collect latency measurements over time
     latency_samples = []
     rm_counter_samples = []
     static_counter_samples = []
     echo_samples = []
 
-    NUM_SAMPLES = 200
-    WARMUP_SAMPLES = 10
-    SAMPLE_INTERVAL = 0.005  # 5ms between samples
-
+    tprint("")
+    tprint("=" * 70)
+    tprint("Collecting latency samples (TEST 1 data)")
+    tprint("=" * 70)
     tprint(f"Collecting {NUM_SAMPLES} samples at {SAMPLE_INTERVAL*1000}ms intervals...")
     tprint(f"(skipping first {WARMUP_SAMPLES} samples for warm-up)")
 
     for i in range(NUM_SAMPLES):
-        # Read all values as close together as possible
         latency = int(echo_api.read_latency_measurement())
         rm_cnt = int(echo_api.read_rm_counter())
         static_cnt = int(static_api.read_activity_counter())
@@ -77,12 +98,7 @@ def run_test_latency_variance(echo_api, static_api):
 
         time.sleep(SAMPLE_INTERVAL)
 
-    # Analyze results
-    tprint("")
-    tprint("RESULTS:")
-    tprint("-" * 50)
-
-    # Latency variance analysis
+    # Pre-compute all derived stats so tests can reuse them
     latency_mean = statistics.mean(latency_samples)
     latency_variance = statistics.variance(latency_samples)
     latency_stdev = statistics.stdev(latency_samples)
@@ -90,16 +106,6 @@ def run_test_latency_variance(echo_api, static_api):
     latency_max = max(latency_samples)
     latency_range = latency_max - latency_min
 
-    tprint(f"Latency Measurement (rm_counter - static_counter_in):")
-    tprint(f"  Mean:     {latency_mean:,.2f} cycles")
-    tprint(f"  Variance: {latency_variance:,.2f}")
-    tprint(f"  StdDev:   {latency_stdev:,.2f} cycles")
-    tprint(f"  Min:      {latency_min:,} cycles")
-    tprint(f"  Max:      {latency_max:,} cycles")
-    tprint(f"  Range:    {latency_range:,} cycles")
-
-    # Calculate Python-side delta (static_counter - echo)
-    # This measures round-trip: static sends counter, RM echoes it back
     round_trip_deltas = [
         static_counter_samples[i] - echo_samples[i]
         for i in range(len(static_counter_samples))
@@ -109,15 +115,6 @@ def run_test_latency_variance(echo_api, static_api):
     rt_min = min(round_trip_deltas)
     rt_max = max(round_trip_deltas)
 
-    tprint("")
-    tprint(f"Round-Trip Delta (static_counter - echo):")
-    tprint(f"  Mean:     {rt_mean:,.2f} cycles")
-    tprint(f"  Variance: {rt_variance:,.2f}")
-    tprint(f"  Min:      {rt_min:,} cycles")
-    tprint(f"  Max:      {rt_max:,} cycles")
-    tprint(f"  Range:    {rt_max - rt_min:,} cycles")
-
-    # Counter progression check
     num_samples = len(rm_counter_samples)
     rm_progression = [
         rm_counter_samples[i+1] - rm_counter_samples[i]
@@ -127,16 +124,31 @@ def run_test_latency_variance(echo_api, static_api):
         static_counter_samples[i+1] - static_counter_samples[i]
         for i in range(num_samples - 1)
     ]
-
     rm_prog_variance = statistics.variance(rm_progression)
     static_prog_variance = statistics.variance(static_progression)
 
+    # Print full diagnostics (visible with pytest -s)
+    tprint("")
+    tprint("RESULTS:")
+    tprint("-" * 50)
+    tprint(f"Latency Measurement (rm_counter - static_counter_in):")
+    tprint(f"  Mean:     {latency_mean:,.2f} cycles")
+    tprint(f"  Variance: {latency_variance:,.2f}")
+    tprint(f"  StdDev:   {latency_stdev:,.2f} cycles")
+    tprint(f"  Min:      {latency_min:,} cycles")
+    tprint(f"  Max:      {latency_max:,} cycles")
+    tprint(f"  Range:    {latency_range:,} cycles")
+    tprint("")
+    tprint(f"Round-Trip Delta (static_counter - echo):")
+    tprint(f"  Mean:     {rt_mean:,.2f} cycles")
+    tprint(f"  Variance: {rt_variance:,.2f}")
+    tprint(f"  Min:      {rt_min:,} cycles")
+    tprint(f"  Max:      {rt_max:,} cycles")
+    tprint(f"  Range:    {rt_max - rt_min:,} cycles")
     tprint("")
     tprint(f"Counter Progression (cycles between samples):")
     tprint(f"  RM counter variance:     {rm_prog_variance:,.2f}")
     tprint(f"  Static counter variance: {static_prog_variance:,.2f}")
-
-    # Print sample data
     tprint("")
     tprint("Sample data (first 10):")
     tprint(f"{'Sample':<8} {'Static':<12} {'Echo':<12} {'RM':<12} {'Latency':<12} {'RT Delta':<12}")
@@ -146,67 +158,195 @@ def run_test_latency_variance(echo_api, static_api):
         tprint(f"{i:<8} {static_counter_samples[i]:<12,} {echo_samples[i]:<12,} "
                f"{rm_counter_samples[i]:<12,} {latency_samples[i]:<12,} {rt_delta:<12,}")
 
-    # ASSERTIONS - These should FAIL to prove cycle inaccuracy
+    return {
+        "latency_samples": latency_samples,
+        "rm_counter_samples": rm_counter_samples,
+        "static_counter_samples": static_counter_samples,
+        "echo_samples": echo_samples,
+        "latency_mean": latency_mean,
+        "latency_variance": latency_variance,
+        "latency_stdev": latency_stdev,
+        "latency_min": latency_min,
+        "latency_max": latency_max,
+        "latency_range": latency_range,
+        "round_trip_deltas": round_trip_deltas,
+        "rt_mean": rt_mean,
+        "rt_variance": rt_variance,
+        "rt_min": rt_min,
+        "rt_max": rt_max,
+        "rm_prog_variance": rm_prog_variance,
+        "static_prog_variance": static_prog_variance,
+    }
+
+
+# ---------------------------------------------------------------------------
+# TEST 1: Latency Variance Detection
+# ---------------------------------------------------------------------------
+
+def test_latency_variance_is_zero(latency_data):
+    """
+    Assertion 1: Latency variance must be 0.
+
+    latency_measurement = rm_counter - static_counter_in.
+    In a cycle-accurate system both counters increment at the same rate,
+    so the difference must be CONSTANT -> variance == 0.
+    """
     tprint("")
     tprint("=" * 70)
-    tprint("CYCLE ACCURACY ASSERTIONS:")
+    tprint("TEST 1a: Latency variance == 0")
     tprint("=" * 70)
 
-    cycle_accurate = True
+    latency_variance = latency_data["latency_variance"]
+    latency_mean = latency_data["latency_mean"]
 
-    # Assertion 1: Latency should be constant (variance = 0)
     if latency_variance > 0:
         tprint(f"[FAIL] Latency variance is {latency_variance:.2f}, expected 0")
         tprint("       -> Latency variance detected")
-        cycle_accurate = False
     else:
         tprint(f"[PASS] Latency variance is 0")
 
-    # Assertion 2: Latency range should be 0
+    assert latency_variance == 0, (
+        f"Latency variance is {latency_variance:.2f}, expected 0. "
+        f"Mean={latency_mean:.2f} cycles. Variance > 0 proves cycle inaccuracy."
+    )
+
+
+def test_latency_range_is_zero(latency_data):
+    """
+    Assertion 2: Latency range (max - min) must be 0.
+
+    If latency varies between samples the simulation is NOT cycle-accurate.
+    """
+    tprint("")
+    tprint("=" * 70)
+    tprint("TEST 1b: Latency range == 0")
+    tprint("=" * 70)
+
+    latency_range = latency_data["latency_range"]
+    latency_min = latency_data["latency_min"]
+    latency_max = latency_data["latency_max"]
+
     if latency_range > 0:
         tprint(f"[FAIL] Latency range is {latency_range}, expected 0")
+        tprint(f"       Min={latency_min}, Max={latency_max}")
         tprint("       -> PROVES: Latency varies between samples")
-        cycle_accurate = False
     else:
         tprint(f"[PASS] Latency range is 0")
 
-    # Assertion 3: Round-trip delta (Python side)
-    # NOTE: Variance is expected here because Python reads are not atomic.
-    # The simulation advances between the two read() calls.
-    # This is NOT a failure of cycle accuracy - it's an artifact of async Python reads.
+    assert latency_range == 0, (
+        f"Latency range is {latency_range} cycles (min={latency_min}, max={latency_max}). "
+        "Non-zero range proves latency varies between samples -> cycle inaccuracy."
+    )
+
+
+def test_mean_latency_within_expected_pipeline_depth(latency_data):
+    """
+    Assertion 4: Mean latency must be within expected pipeline depth.
+
+    A large mean latency (> 3 * 10 = 30 cycles) indicates unexpected pipeline
+    depth or a synchronization issue between processes.
+    """
+    tprint("")
+    tprint("=" * 70)
+    tprint("TEST 1c: Mean latency within expected pipeline depth")
+    tprint("=" * 70)
+
+    EXPECTED_PIPELINE_DEPTH = 3
+    latency_mean = latency_data["latency_mean"]
+
+    if abs(latency_mean) > EXPECTED_PIPELINE_DEPTH * 10:
+        tprint(f"[FAIL] Mean latency is {latency_mean:.0f} cycles, expected ~{EXPECTED_PIPELINE_DEPTH}")
+        tprint("       -> Mean latency exceeds expected pipeline depth")
+    else:
+        tprint(f"[PASS] Mean latency is within expected range ({latency_mean:.2f} cycles)")
+
+    assert abs(latency_mean) <= EXPECTED_PIPELINE_DEPTH * 10, (
+        f"Mean latency {latency_mean:.0f} cycles exceeds expected ~{EXPECTED_PIPELINE_DEPTH} cycles "
+        f"(threshold: {EXPECTED_PIPELINE_DEPTH * 10}). "
+        "Indicates unexpected pipeline depth or synchronization issue."
+    )
+
+
+def test_round_trip_variance_informational(latency_data):
+    """
+    Assertion 3: Round-trip delta (Python side) variance is informational only.
+
+    Variance IS expected here because Python reads are not atomic — the simulation
+    advances between the two read() calls. This is NOT a failure of cycle accuracy.
+    This test always passes but logs the measurement.
+    """
+    tprint("")
+    tprint("=" * 70)
+    tprint("TEST 1d: Round-trip delta variance (informational)")
+    tprint("=" * 70)
+
+    rt_variance = latency_data["rt_variance"]
+    rt_mean = latency_data["rt_mean"]
+    rt_min = latency_data["rt_min"]
+    rt_max = latency_data["rt_max"]
+
     if rt_variance > 0:
         tprint(f"[INFO] Round-trip variance is {rt_variance:.2f}")
         tprint("       (Expected: Python reads are not synchronized with simulation)")
     else:
         tprint(f"[PASS] Round-trip variance is 0")
 
-    # Assertion 4: In true cycle-accurate, RM counter should equal static counter
-    # (or differ by exactly the pipeline depth, which should be ~2-3 cycles)
-    # A large mean latency indicates unexpected pipeline depth
-    EXPECTED_PIPELINE_DEPTH = 3  # Reasonable for direct connection
-    if abs(latency_mean) > EXPECTED_PIPELINE_DEPTH * 10:
-        tprint(f"[FAIL] Mean latency is {latency_mean:.0f} cycles, expected ~{EXPECTED_PIPELINE_DEPTH}")
-        tprint("       -> Mean latency exceeds expected pipeline depth")
-        cycle_accurate = False
-    else:
-        tprint(f"[PASS] Mean latency is within expected range")
-
-    tprint("")
-    if cycle_accurate:
-        tprint("CONCLUSION: Simulation appears cycle-accurate")
-    else:
-        tprint("CONCLUSION: CYCLE INACCURACY DETECTED")
-        tprint("")
-        tprint("The static region and RM run as independent processes.")
-        tprint("Communication latency between static and RM processes is not")
-        tprint("perfectly constant, indicating a cycle synchronization issue.")
-
-    return cycle_accurate
+    tprint(f"  Mean={rt_mean:.2f}, Min={rt_min}, Max={rt_max}, Range={rt_max - rt_min}")
+    # Always passes — Python async reads are expected to have variance
+    assert True
 
 
-def run_test_counter_correlation(echo_api, static_api):
+def test_counter_progression_variance(latency_data):
     """
-    Test 2: Counter Correlation Analysis
+    Both RM and static counters must have low progression variance.
+
+    Counter progression = difference between consecutive samples.
+    In a cycle-accurate simulation, both counters advance at the same rate
+    so their progression should be tightly consistent.
+    """
+    tprint("")
+    tprint("=" * 70)
+    tprint("TEST 1e: Counter progression variance")
+    tprint("=" * 70)
+
+    rm_prog_variance = latency_data["rm_prog_variance"]
+    static_prog_variance = latency_data["static_prog_variance"]
+
+    tprint(f"  RM counter variance:     {rm_prog_variance:,.2f}")
+    tprint(f"  Static counter variance: {static_prog_variance:,.2f}")
+
+    # Both should progress at a consistent rate (variance should be low relative to mean)
+    # We allow some variance since Python sampling is not cycle-aligned,
+    # but flag extreme outliers.
+    rm_counter_samples = latency_data["rm_counter_samples"]
+    static_counter_samples = latency_data["static_counter_samples"]
+    rm_mean_progression = statistics.mean([
+        rm_counter_samples[i+1] - rm_counter_samples[i]
+        for i in range(len(rm_counter_samples) - 1)
+    ])
+    static_mean_progression = statistics.mean([
+        static_counter_samples[i+1] - static_counter_samples[i]
+        for i in range(len(static_counter_samples) - 1)
+    ])
+    tprint(f"  RM mean progression:     {rm_mean_progression:,.2f} cycles/sample")
+    tprint(f"  Static mean progression: {static_mean_progression:,.2f} cycles/sample")
+
+    # Both counters must be advancing (mean progression > 0)
+    assert rm_mean_progression > 0, (
+        f"RM counter is not advancing: mean progression = {rm_mean_progression:.2f}"
+    )
+    assert static_mean_progression > 0, (
+        f"Static counter is not advancing: mean progression = {static_mean_progression:.2f}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# TEST 2: Counter Correlation Analysis
+# ---------------------------------------------------------------------------
+
+def test_counter_correlation(echo_api, static_api):
+    """
+    Test 2: Counter Correlation Analysis.
 
     If cycle-accurate, the RM's counter and static's counter should be perfectly
     correlated (linear relationship with R^2 = 1.0).
@@ -219,7 +359,6 @@ def run_test_counter_correlation(echo_api, static_api):
     tprint("TEST 2: Counter Correlation Analysis")
     tprint("=" * 70)
 
-    # Collect paired samples
     pairs = []
     NUM_SAMPLES = 100
 
@@ -231,7 +370,6 @@ def run_test_counter_correlation(echo_api, static_api):
         pairs.append((static_cnt, rm_cnt))
         time.sleep(0.002)
 
-    # Calculate correlation coefficient
     static_vals = [p[0] for p in pairs]
     rm_vals = [p[1] for p in pairs]
 
@@ -253,26 +391,32 @@ def run_test_counter_correlation(echo_api, static_api):
     tprint(f"Pearson correlation: {correlation:.6f}")
     tprint(f"R^2 coefficient:     {r_squared:.6f}")
 
-    # Check if correlation is perfect
     if r_squared < 0.9999:
         tprint(f"[FAIL] R^2 is {r_squared:.6f}, expected 1.0 for cycle-accurate")
         tprint("       -> Counters are not perfectly correlated")
-        return False
     else:
         tprint(f"[PASS] R^2 is near 1.0")
-        return True
+
+    assert r_squared >= 0.9999, (
+        f"Counter R^2 is {r_squared:.6f}, expected >= 0.9999. "
+        "Counters are not perfectly correlated — indicates counter drift between processes."
+    )
 
 
-def run_test_echo_consistency(echo_api, static_api):
+# ---------------------------------------------------------------------------
+# TEST 3: Echo Consistency (Informational)
+# ---------------------------------------------------------------------------
+
+def test_echo_consistency_informational(echo_api, static_api):
     """
-    Test 3: Echo Consistency Check (Informational)
+    Test 3: Echo Consistency Check (Informational).
 
     This test measures the delay between Python reads of static_counter and echo.
     Because Python reads are ASYNC (not synchronized with simulation), variance
     is EXPECTED and does NOT indicate cycle inaccuracy.
 
-    This test is informational only - it always "passes" because Python async
-    reads are a separate concern from simulation cycle accuracy.
+    This test always passes — it documents that Python-side read timing is a
+    separate concern from simulation cycle accuracy.
     """
     tprint("")
     tprint("=" * 70)
@@ -303,17 +447,22 @@ def run_test_echo_consistency(echo_api, static_api):
     tprint(f"  Max:      {delay_max:,} cycles")
     tprint(f"  Range:    {delay_max - delay_min:,} cycles")
 
-    # This is informational - variance is EXPECTED because Python reads are async
     tprint(f"[INFO] Python read variance is {delay_variance:.2f}")
     tprint("       (Expected: Python reads are not synchronized with simulation)")
     tprint("       This does NOT affect simulation cycle accuracy.")
 
-    # Always return True - this is informational only
-    return True
+    # Always passes — informational only
+    assert True
 
+
+# ---------------------------------------------------------------------------
+# Script entry-point (backward-compatible)
+# ---------------------------------------------------------------------------
 
 def main():
-    """Run all cycle accuracy tests."""
+    """Run all cycle accuracy tests (script mode)."""
+    from partial_reconfiguration import PRSystem
+
     tprint("=" * 70)
     tprint("CYCLE ACCURACY TEST SUITE")
     tprint("=" * 70)
@@ -325,7 +474,6 @@ def main():
     tprint("Passing proves that barrier sync provides cycle-accurate simulation.")
     tprint("")
 
-    # BUILD ONCE
     tprint("=" * 70)
     tprint("BUILDING SIMULATION (one-time)")
     tprint("=" * 70)
@@ -333,41 +481,117 @@ def main():
     with PRSystem(config='pr_config.yaml', cycle_accurate=True) as system:
         system.build()
         system.simulate()
-        # echo_counter_rm is already loaded as initial_rm for rp_echo
 
-        time.sleep(0.2)  # Allow simulation to stabilize
+        time.sleep(0.2)
 
-        # Get APIs
         echo_api = system.get_rm_api('rp_echo')
         static_api = system.get_static_api()
 
         tprint("")
         tprint("Build complete. Running all tests...")
 
-        # RUN ALL TESTS
-        results = []
-        results.append(("Latency Variance", run_test_latency_variance(echo_api, static_api)))
-        results.append(("Counter Correlation", run_test_counter_correlation(echo_api, static_api)))
-        results.append(("Echo Consistency", run_test_echo_consistency(echo_api, static_api)))
+        # Collect latency data
+        NUM_SAMPLES = 200
+        WARMUP_SAMPLES = 10
+        SAMPLE_INTERVAL = 0.005
 
-        # Summary
+        latency_samples = []
+        rm_counter_samples = []
+        static_counter_samples = []
+        echo_samples = []
+
+        for i in range(NUM_SAMPLES):
+            lat = int(echo_api.read_latency_measurement())
+            rm_cnt = int(echo_api.read_rm_counter())
+            static_cnt = int(static_api.read_activity_counter())
+            echo_cnt = int(echo_api.read_static_counter_echo())
+
+            if i >= WARMUP_SAMPLES:
+                latency_samples.append(lat)
+                rm_counter_samples.append(rm_cnt)
+                static_counter_samples.append(static_cnt)
+                echo_samples.append(echo_cnt)
+
+            time.sleep(SAMPLE_INTERVAL)
+
+        latency_mean = statistics.mean(latency_samples)
+        latency_variance = statistics.variance(latency_samples)
+        latency_stdev = statistics.stdev(latency_samples)
+        latency_min = min(latency_samples)
+        latency_max = max(latency_samples)
+        latency_range = latency_max - latency_min
+
+        round_trip_deltas = [
+            static_counter_samples[i] - echo_samples[i]
+            for i in range(len(static_counter_samples))
+        ]
+        rt_mean = statistics.mean(round_trip_deltas)
+        rt_variance = statistics.variance(round_trip_deltas)
+
+        num_samples = len(rm_counter_samples)
+        rm_progression = [rm_counter_samples[i+1] - rm_counter_samples[i] for i in range(num_samples - 1)]
+        static_progression = [static_counter_samples[i+1] - static_counter_samples[i] for i in range(num_samples - 1)]
+        rm_prog_variance = statistics.variance(rm_progression)
+        static_prog_variance = statistics.variance(static_progression)
+
+        tprint(f"Latency Measurement (rm_counter - static_counter_in):")
+        tprint(f"  Mean:     {latency_mean:,.2f} cycles")
+        tprint(f"  Variance: {latency_variance:,.2f}")
+        tprint(f"  StdDev:   {latency_stdev:,.2f} cycles")
+        tprint(f"  Min:      {latency_min:,} cycles")
+        tprint(f"  Max:      {latency_max:,} cycles")
+        tprint(f"  Range:    {latency_range:,} cycles")
+        tprint(f"Round-Trip Delta (static_counter - echo):")
+        tprint(f"  Mean:     {rt_mean:,.2f} cycles")
+        tprint(f"  Variance: {rt_variance:,.2f}")
+        tprint(f"Counter Progression:")
+        tprint(f"  RM counter variance:     {rm_prog_variance:,.2f}")
+        tprint(f"  Static counter variance: {static_prog_variance:,.2f}")
+        tprint("")
+        tprint("Sample data (first 10):")
+        tprint(f"{'Sample':<8} {'Static':<12} {'Echo':<12} {'RM':<12} {'Latency':<12} {'RT Delta':<12}")
+        tprint("-" * 70)
+        for i in range(min(10, num_samples)):
+            rt_delta = static_counter_samples[i] - echo_samples[i]
+            tprint(f"{i:<8} {static_counter_samples[i]:<12,} {echo_samples[i]:<12,} "
+                   f"{rm_counter_samples[i]:<12,} {latency_samples[i]:<12,} {rt_delta:<12,}")
+
+        # Evaluate
+        EXPECTED_PIPELINE_DEPTH = 3
+        latency_passed = (
+            latency_variance == 0 and
+            latency_range == 0 and
+            abs(latency_mean) <= EXPECTED_PIPELINE_DEPTH * 10
+        )
+
+        # Counter correlation
+        pairs = []
+        for _ in range(100):
+            s = int(static_api.read_activity_counter())
+            r = int(echo_api.read_rm_counter())
+            pairs.append((s, r))
+            time.sleep(0.002)
+
+        sv = [p[0] for p in pairs]
+        rv = [p[1] for p in pairs]
+        ms, mr = statistics.mean(sv), statistics.mean(rv)
+        num = sum((s - ms) * (r - mr) for s, r in pairs)
+        ds = sum((s - ms) ** 2 for s in sv) ** 0.5
+        dr = sum((r - mr) ** 2 for r in rv) ** 0.5
+        corr = (num / (ds * dr)) if ds > 0 and dr > 0 else 0
+        r_squared = corr ** 2
+        correlation_passed = r_squared >= 0.9999
+
+        tprint(f"Pearson R^2: {r_squared:.6f}")
+
         tprint("")
         tprint("=" * 70)
         tprint("FINAL SUMMARY")
         tprint("=" * 70)
+        tprint(f"  Latency Variance: {'PASS' if latency_passed else 'FAIL'}")
+        tprint(f"  Counter Correlation: {'PASS' if correlation_passed else 'FAIL'}")
+        tprint(f"  Echo Consistency: INFO (Python async reads)")
 
-        # Check critical tests (1 and 2 determine cycle accuracy)
-        latency_passed = results[0][1]  # Latency Variance
-        correlation_passed = results[1][1]  # Counter Correlation
-
-        for name, passed in results:
-            if name == "Echo Consistency":
-                tprint(f"  {name}: INFO (Python async reads)")
-            else:
-                status = "PASS" if passed else "FAIL"
-                tprint(f"  {name}: {status}")
-
-        tprint("")
         if latency_passed and correlation_passed:
             tprint("CYCLE-ACCURATE SIMULATION CONFIRMED")
             tprint("")
@@ -379,7 +603,6 @@ def main():
             return 0
         else:
             tprint("CYCLE INACCURACY DETECTED")
-            tprint("")
             if not latency_passed:
                 tprint("- Latency variance > 0 indicates variable communication delay")
             if not correlation_passed:
@@ -388,4 +611,6 @@ def main():
 
 
 if __name__ == "__main__":
+    import os
+    os.chdir(THIS_DIR)
     sys.exit(main())

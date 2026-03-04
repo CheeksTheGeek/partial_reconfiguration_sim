@@ -6,6 +6,8 @@ from typing import Dict, List, Optional, Tuple, Set, Any
 from pathlib import Path
 
 import pyslang
+import pyslang.ast
+import pyslang.syntax
 
 logger = logging.getLogger(__name__)
 
@@ -280,13 +282,13 @@ class RTLParser:
         trees = []
         for path in source_paths:
             try:
-                tree = pyslang.SyntaxTree.fromFile(path)
+                tree = pyslang.syntax.SyntaxTree.fromFile(path)
                 if tree is None:
                     raise ValueError(f"Failed to parse file: {path}")
                 trees.append(tree)
             except Exception as e:
                 raise ValueError(f"Error parsing {path}: {e}")
-        compilation = pyslang.Compilation()
+        compilation = pyslang.ast.Compilation()
         for tree in trees:
             compilation.addSyntaxTree(tree)
         diags = compilation.getAllDiagnostics()
@@ -440,9 +442,9 @@ class RTLParser:
     def _get_direction(self, arg_direction) -> Optional[str]:
         """Convert pyslang ArgumentDirection to string."""
         direction_map = {
-            pyslang.ArgumentDirection.In: 'input',
-            pyslang.ArgumentDirection.Out: 'output',
-            pyslang.ArgumentDirection.InOut: 'inout',
+            pyslang.ast.ArgumentDirection.In: 'input',
+            pyslang.ast.ArgumentDirection.Out: 'output',
+            pyslang.ast.ArgumentDirection.InOut: 'inout',
         }
         return direction_map.get(arg_direction)
 
@@ -518,8 +520,8 @@ class RTLParser:
         ModuleInfo
             Information about the parsed module
         """
-        tree = pyslang.SyntaxTree.fromText(sv_code)
-        compilation = pyslang.Compilation()
+        tree = pyslang.syntax.SyntaxTree.fromText(sv_code)
+        compilation = pyslang.ast.Compilation()
         compilation.addSyntaxTree(tree)
 
         root = compilation.getRoot()
