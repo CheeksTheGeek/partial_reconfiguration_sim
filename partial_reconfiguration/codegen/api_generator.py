@@ -40,6 +40,7 @@ class ApiGenerator:
             nc = (port.width + 63) // 64  # num_chunks
             if self._is_writable(port.direction):
                 if nc > 1:
+                    mask = (1 << port.width) - 1
                     lines.append(f'    def write_{port.name}(self, value: int):')
                     lines.append(f'        for _i in range({nc}):')
                     lines.append(f'            self._shm.write_port({port.index} + _i, (value >> (_i * 64)) & 0xFFFFFFFFFFFFFFFF)')
@@ -48,26 +49,29 @@ class ApiGenerator:
                     lines.append(f'        _result = 0')
                     lines.append(f'        for _i in range({nc}):')
                     lines.append(f'            _result |= self._shm.read_port({port.index} + _i) << (_i * 64)')
-                    lines.append(f'        return _result')
+                    lines.append(f'        return _result & {mask}')
                     lines.append('')
                 else:
+                    mask = (1 << port.width) - 1
                     lines.append(f'    def write_{port.name}(self, value: int):')
                     lines.append(f'        self._shm.write_port({port.index}, value)')
                     lines.append('')
                     lines.append(f'    def read_{port.name}(self) -> int:')
-                    lines.append(f'        return self._shm.read_port({port.index})')
+                    lines.append(f'        return self._shm.read_port({port.index}) & {mask}')
                     lines.append('')
             else:
                 if nc > 1:
+                    mask = (1 << port.width) - 1
                     lines.append(f'    def read_{port.name}(self) -> int:')
                     lines.append(f'        _result = 0')
                     lines.append(f'        for _i in range({nc}):')
                     lines.append(f'            _result |= self._shm.read_port({port.index} + _i) << (_i * 64)')
-                    lines.append(f'        return _result')
+                    lines.append(f'        return _result & {mask}')
                     lines.append('')
                 else:
+                    mask = (1 << port.width) - 1
                     lines.append(f'    def read_{port.name}(self) -> int:')
-                    lines.append(f'        return self._shm.read_port({port.index})')
+                    lines.append(f'        return self._shm.read_port({port.index}) & {mask}')
                     lines.append('')
 
         return '\n'.join(lines)
