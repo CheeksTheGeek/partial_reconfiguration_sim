@@ -11,13 +11,19 @@ Verilator WIDTHEXPAND/WIDTHTRUNC warnings. Ports are classified into
 DPI type bands:
   - 1-32 bits  -> DPI `int`     (C++ `int`)
   - 33-64 bits -> DPI `longint` (C++ `long long`)
+  - >64 bits   -> chunked into multiple 64-bit DPI calls
 """
-from typing import List, Dict
+from typing import List, Dict, Optional
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def num_chunks(width: int) -> int:
+    """Number of 64-bit SHM slots needed for a port of the given width."""
+    return (width + 63) // 64
 
 
 @dataclass
@@ -26,6 +32,11 @@ class BoundaryPort:
     name: str
     width: int
     direction: str  # 'to_rm' or 'from_rm'
+    clock: Optional[str] = None  # per-port clock override; None = use partition primary
+
+    @property
+    def num_chunks(self) -> int:
+        return (self.width + 63) // 64
 
 
 @dataclass
@@ -34,55 +45,87 @@ class PartitionBoundaryDef:
     partition_name: str
     rm_module_name: str
     ports: List[BoundaryPort]
-    clock_name: str = 'clk'
+    clock_names: List[str] = field(default_factory=lambda: ['clk'])
+    reset_name: Optional[str] = None
+    reset_polarity: str = 'negative'  # 'negative' (active-low) or 'positive'
+
+    @property
+    def clock_name(self) -> str:
+        """Backward-compat: primary clock."""
+        return self.clock_names[0]
 
 
 def _dpi_type(width: int) -> str:
-    """Select the DPI-C type that covers the given bit width."""
+    """Select the DPI-C type for a chunk of the given bit width (max 64)."""
     if width <= 32:
         return 'int'
-    elif width <= 64:
-        return 'longint'
     else:
-        raise ValueError(
-            f"Port width {width} exceeds 64 bits — "
-            f"DPI-C scalar types max out at longint (64). "
-            f"Consider splitting into multiple ports."
-        )
+        return 'longint'
 
 
-def _sv_send_cast(port: BoundaryPort) -> str:
+def _chunk_width(port_width: int, chunk_idx: int) -> int:
+    """Return the effective bit width of a specific chunk."""
+    lo = chunk_idx * 64
+    hi = min(lo + 63, port_width - 1)
+    return hi - lo + 1
+
+
+def _sv_send_cast(port: BoundaryPort, chunk_idx: int = 0) -> str:
     """
     Generate the SV expression that widens a port value to the DPI type width.
 
     For exact-width matches (32 or 64), no cast needed.
     For narrower signals, zero-extend to the DPI type width.
+    For wide ports (>64), extract the appropriate chunk slice.
     """
-    dpi = _dpi_type(port.width)
+    lo = chunk_idx * 64
+    hi = min(lo + 63, port.width - 1)
+    cw = hi - lo + 1
+    dpi = _dpi_type(cw)
+
+    # Get the source expression (slice for wide ports, full name for narrow)
+    if port.width > 64:
+        src = f"{port.name}[{hi}:{lo}]"
+    elif port.width > 1 and cw < port.width:
+        src = f"{port.name}[{hi}:{lo}]"
+    else:
+        src = port.name
+
     if dpi == 'int':
-        if port.width == 32:
-            return port.name
-        # Zero-extend narrow signal to 32 bits
-        return f"int'({{{32 - port.width}'d0, {port.name}}})"
+        if cw == 32:
+            return src
+        pad = 32 - cw
+        return f"int'({{{pad}'d0, {src}}})"
     else:  # longint
-        if port.width == 64:
-            return port.name
-        return f"longint'({{{64 - port.width}'d0, {port.name}}})"
+        if cw == 64:
+            return src
+        pad = 64 - cw
+        return f"longint'({{{pad}'d0, {src}}})"
 
 
-def _sv_recv_trunc(port: BoundaryPort, expr: str) -> str:
+def _sv_recv_trunc(port: BoundaryPort, expr: str, chunk_idx: int = 0):
     """
     Generate the SV expression that truncates a DPI return value to port width.
 
-    For exact-width matches, direct assignment.
-    For narrower ports, bit-select the relevant bits.
+    For wide ports (>64), returns (lhs_slice, rhs_expr) tuple.
+    For narrow ports, returns the expression string.
     """
-    dpi = _dpi_type(port.width)
-    if dpi == 'int' and port.width == 32:
-        return expr
-    if dpi == 'longint' and port.width == 64:
-        return expr
-    return f"{expr}[{port.width - 1}:0]"
+    lo = chunk_idx * 64
+    hi = min(lo + 63, port.width - 1)
+    cw = hi - lo + 1
+
+    if port.width > 64:
+        # Wide port: assign to a slice
+        trunc = expr if cw in (32, 64) else f"{expr}[{cw - 1}:0]"
+        return (f"{port.name}[{hi}:{lo}]", trunc)
+    else:
+        # Narrow port: original behavior
+        dpi = _dpi_type(port.width)
+        if dpi == 'int' and port.width == 32:
+            return expr
+        if dpi == 'longint' and port.width == 64:
+            return expr
+        return f"{expr}[{port.width - 1}:0]"
 
 
 class DpiBridgeGenerator:
@@ -128,8 +171,12 @@ class DpiBridgeGenerator:
 
         # Module declaration with same ports as RM
         lines.append(f"module {module_name} (")
-        lines.append(f"    input wire {boundary.clock_name},")
-        port_lines = []
+        # Clock ports
+        clock_port_lines = [f"    input wire {clk}" for clk in boundary.clock_names]
+        # Reset port (if configured)
+        if boundary.reset_name is not None:
+            clock_port_lines.append(f"    input wire {boundary.reset_name}")
+        port_lines = list(clock_port_lines)
         for port in boundary.ports:
             width_str = f"[{port.width-1}:0] " if port.width > 1 else ""
             if port.direction == 'to_rm':
@@ -140,48 +187,84 @@ class DpiBridgeGenerator:
         lines.append(");")
         lines.append("")
 
-        # DPI imports — width-matched types
+        # DPI imports — width-matched types, chunked for wide ports
         for port in to_rm:
-            dt = _dpi_type(port.width)
-            lines.append(
-                f'    import "DPI-C" function void '
-                f'dpi_static_{part}_{port.name}_send(input {dt} data);'
-            )
+            nc = port.num_chunks
+            for c in range(nc):
+                cw = _chunk_width(port.width, c)
+                dt = _dpi_type(cw)
+                suffix = f"_chunk{c}_send" if nc > 1 else "_send"
+                lines.append(
+                    f'    import "DPI-C" function void '
+                    f'dpi_static_{part}_{port.name}{suffix}(input {dt} data);'
+                )
         lines.append("")
 
         for port in from_rm:
-            dt = _dpi_type(port.width)
-            lines.append(
-                f'    import "DPI-C" function {dt} '
-                f'dpi_static_{part}_{port.name}_recv_data();'
-            )
-            lines.append(
-                f'    import "DPI-C" function int '
-                f'dpi_static_{part}_{port.name}_recv_valid();'
-            )
+            nc = port.num_chunks
+            for c in range(nc):
+                cw = _chunk_width(port.width, c)
+                dt = _dpi_type(cw)
+                suffix_d = f"_chunk{c}_recv_data" if nc > 1 else "_recv_data"
+                suffix_v = f"_chunk{c}_recv_valid" if nc > 1 else "_recv_valid"
+                lines.append(
+                    f'    import "DPI-C" function {dt} '
+                    f'dpi_static_{part}_{port.name}{suffix_d}();'
+                )
+                lines.append(
+                    f'    import "DPI-C" function int '
+                    f'dpi_static_{part}_{port.name}{suffix_v}();'
+                )
         lines.append("")
 
-        # Send inputs to RM every cycle
-        if to_rm:
-            lines.append(f"    // Send inputs to RM via DPI channels")
-            lines.append(f"    always @(posedge {boundary.clock_name}) begin")
-            for port in to_rm:
-                arg = _sv_send_cast(port)
-                lines.append(f"        dpi_static_{part}_{port.name}_send({arg});")
-            lines.append("    end")
-            lines.append("")
+        # Group ports by their effective clock
+        def _port_clock(p):
+            return p.clock or boundary.clock_names[0]
 
-        # Receive outputs from RM every cycle
+        # Send inputs to RM — grouped per clock
+        if to_rm:
+            clk_groups = {}
+            for port in to_rm:
+                clk = _port_clock(port)
+                clk_groups.setdefault(clk, []).append(port)
+            for clk, ports in clk_groups.items():
+                lines.append(f"    // Send inputs to RM via DPI channels (clock: {clk})")
+                lines.append(f"    always @(posedge {clk}) begin")
+                for port in ports:
+                    nc = port.num_chunks
+                    for c in range(nc):
+                        arg = _sv_send_cast(port, c)
+                        suffix = f"_chunk{c}_send" if nc > 1 else "_send"
+                        lines.append(f"        dpi_static_{part}_{port.name}{suffix}({arg});")
+                lines.append("    end")
+                lines.append("")
+
+        # Receive outputs from RM — grouped per clock
         if from_rm:
-            lines.append(f"    // Receive outputs from RM via DPI channels")
-            lines.append(f"    always @(posedge {boundary.clock_name}) begin")
+            clk_groups = {}
             for port in from_rm:
-                recv_fn = f"dpi_static_{part}_{port.name}_recv_data()"
-                trunc_expr = _sv_recv_trunc(port, recv_fn)
-                lines.append(f"        if (dpi_static_{part}_{port.name}_recv_valid())")
-                lines.append(f"            {port.name} <= {trunc_expr};")
-            lines.append("    end")
-            lines.append("")
+                clk = _port_clock(port)
+                clk_groups.setdefault(clk, []).append(port)
+            for clk, ports in clk_groups.items():
+                lines.append(f"    // Receive outputs from RM via DPI channels (clock: {clk})")
+                lines.append(f"    always @(posedge {clk}) begin")
+                for port in ports:
+                    nc = port.num_chunks
+                    for c in range(nc):
+                        suffix_d = f"_chunk{c}_recv_data" if nc > 1 else "_recv_data"
+                        suffix_v = f"_chunk{c}_recv_valid" if nc > 1 else "_recv_valid"
+                        recv_fn = f"dpi_static_{part}_{port.name}{suffix_d}()"
+                        result = _sv_recv_trunc(port, recv_fn, c)
+                        valid_fn = f"dpi_static_{part}_{port.name}{suffix_v}()"
+                        if isinstance(result, tuple):
+                            lhs, rhs = result
+                            lines.append(f"        if ({valid_fn})")
+                            lines.append(f"            {lhs} <= {rhs};")
+                        else:
+                            lines.append(f"        if ({valid_fn})")
+                            lines.append(f"            {port.name} <= {result};")
+                lines.append("    end")
+                lines.append("")
 
         lines.append("endmodule")
 
@@ -218,30 +301,42 @@ class DpiBridgeGenerator:
         lines.append("`timescale 1ns/1ps")
         lines.append("")
 
-        # Module declaration - only clk as port
+        # Module declaration — all clocks + optional reset as ports
         lines.append(f"module {wrapper_name} (")
-        lines.append(f"    input wire clk")
+        wrapper_ports = [f"    input wire {clk}" for clk in boundary.clock_names]
+        if boundary.reset_name is not None:
+            wrapper_ports.append(f"    input wire {boundary.reset_name}")
+        lines.append(",\n".join(wrapper_ports))
         lines.append(");")
         lines.append("")
 
-        # DPI imports — width-matched types
+        # DPI imports — width-matched types, chunked for wide ports
         for port in to_rm:
-            dt = _dpi_type(port.width)
-            lines.append(
-                f'    import "DPI-C" function {dt} '
-                f'dpi_rm_{part}_{port.name}_recv_data();'
-            )
-            lines.append(
-                f'    import "DPI-C" function int '
-                f'dpi_rm_{part}_{port.name}_recv_valid();'
-            )
+            nc = port.num_chunks
+            for c in range(nc):
+                cw = _chunk_width(port.width, c)
+                dt = _dpi_type(cw)
+                suffix_d = f"_chunk{c}_recv_data" if nc > 1 else "_recv_data"
+                suffix_v = f"_chunk{c}_recv_valid" if nc > 1 else "_recv_valid"
+                lines.append(
+                    f'    import "DPI-C" function {dt} '
+                    f'dpi_rm_{part}_{port.name}{suffix_d}();'
+                )
+                lines.append(
+                    f'    import "DPI-C" function int '
+                    f'dpi_rm_{part}_{port.name}{suffix_v}();'
+                )
 
         for port in from_rm:
-            dt = _dpi_type(port.width)
-            lines.append(
-                f'    import "DPI-C" function void '
-                f'dpi_rm_{part}_{port.name}_send(input {dt} data);'
-            )
+            nc = port.num_chunks
+            for c in range(nc):
+                cw = _chunk_width(port.width, c)
+                dt = _dpi_type(cw)
+                suffix = f"_chunk{c}_send" if nc > 1 else "_send"
+                lines.append(
+                    f'    import "DPI-C" function void '
+                    f'dpi_rm_{part}_{port.name}{suffix}(input {dt} data);'
+                )
         lines.append("")
 
         # Internal registers for to_rm ports (inputs to RM)
@@ -258,37 +353,69 @@ class DpiBridgeGenerator:
         # Instantiate the real RM
         lines.append(f"    // Instantiate the real RM: {rm_design_name}")
         lines.append(f"    {rm_design_name} u_rm (")
-        lines.append(f"        .{boundary.clock_name}(clk),")
-        port_conns = []
+        # Connect all clocks
+        rm_conns = []
+        for clk in boundary.clock_names:
+            rm_conns.append(f"        .{clk}({clk})")
+        # Connect reset if present
+        if boundary.reset_name is not None:
+            rm_conns.append(f"        .{boundary.reset_name}({boundary.reset_name})")
         for port in to_rm:
-            port_conns.append(f"        .{port.name}({port.name})")
+            rm_conns.append(f"        .{port.name}({port.name})")
         for port in from_rm:
-            port_conns.append(f"        .{port.name}({port.name})")
-        lines.append(",\n".join(port_conns))
+            rm_conns.append(f"        .{port.name}({port.name})")
+        lines.append(",\n".join(rm_conns))
         lines.append("    );")
         lines.append("")
 
-        # Update inputs from DPI channels
-        if to_rm:
-            lines.append(f"    // Update inputs from DPI channels (from static region)")
-            lines.append(f"    always @(posedge clk) begin")
-            for port in to_rm:
-                recv_fn = f"dpi_rm_{part}_{port.name}_recv_data()"
-                trunc_expr = _sv_recv_trunc(port, recv_fn)
-                lines.append(f"        if (dpi_rm_{part}_{port.name}_recv_valid())")
-                lines.append(f"            {port.name} <= {trunc_expr};")
-            lines.append("    end")
-            lines.append("")
+        # Group ports by their effective clock
+        def _port_clock(p):
+            return p.clock or boundary.clock_names[0]
 
-        # Send outputs to static via DPI
+        # Update inputs from DPI channels — grouped per clock
+        if to_rm:
+            clk_groups = {}
+            for port in to_rm:
+                clk = _port_clock(port)
+                clk_groups.setdefault(clk, []).append(port)
+            for clk, ports in clk_groups.items():
+                lines.append(f"    // Update inputs from DPI channels (clock: {clk})")
+                lines.append(f"    always @(posedge {clk}) begin")
+                for port in ports:
+                    nc = port.num_chunks
+                    for c in range(nc):
+                        suffix_d = f"_chunk{c}_recv_data" if nc > 1 else "_recv_data"
+                        suffix_v = f"_chunk{c}_recv_valid" if nc > 1 else "_recv_valid"
+                        recv_fn = f"dpi_rm_{part}_{port.name}{suffix_d}()"
+                        result = _sv_recv_trunc(port, recv_fn, c)
+                        valid_fn = f"dpi_rm_{part}_{port.name}{suffix_v}()"
+                        if isinstance(result, tuple):
+                            lhs, rhs = result
+                            lines.append(f"        if ({valid_fn})")
+                            lines.append(f"            {lhs} <= {rhs};")
+                        else:
+                            lines.append(f"        if ({valid_fn})")
+                            lines.append(f"            {port.name} <= {result};")
+                lines.append("    end")
+                lines.append("")
+
+        # Send outputs to static via DPI — grouped per clock
         if from_rm:
-            lines.append(f"    // Send outputs to static region via DPI channels")
-            lines.append(f"    always @(posedge clk) begin")
+            clk_groups = {}
             for port in from_rm:
-                arg = _sv_send_cast(port)
-                lines.append(f"        dpi_rm_{part}_{port.name}_send({arg});")
-            lines.append("    end")
-            lines.append("")
+                clk = _port_clock(port)
+                clk_groups.setdefault(clk, []).append(port)
+            for clk, ports in clk_groups.items():
+                lines.append(f"    // Send outputs to static region via DPI channels (clock: {clk})")
+                lines.append(f"    always @(posedge {clk}) begin")
+                for port in ports:
+                    nc = port.num_chunks
+                    for c in range(nc):
+                        arg = _sv_send_cast(port, c)
+                        suffix = f"_chunk{c}_send" if nc > 1 else "_send"
+                        lines.append(f"        dpi_rm_{part}_{port.name}{suffix}({arg});")
+                lines.append("    end")
+                lines.append("")
 
         lines.append("endmodule")
 

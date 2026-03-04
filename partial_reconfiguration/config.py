@@ -212,6 +212,14 @@ class PRConfig:
                     self.static_region['clocks'] = DEFAULT_CLOCKS
             if 'resets' not in self.static_region:
                 self.static_region['resets'] = DEFAULT_RESETS
+        # Derive partition 'clocks' list from scalar 'clock' or default
+        for part in self.partitions:
+            if 'clocks' not in part:
+                if 'clock' in part:
+                    part['clocks'] = [part['clock']]
+                else:
+                    part['clocks'] = ['clk']
+
         partition_interfaces = {}
         for part in self.partitions:
             partition_interfaces[part['name']] = part.get('interface', {})

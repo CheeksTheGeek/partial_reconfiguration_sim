@@ -360,9 +360,10 @@ class ReconfigurationController:
             return False
 
         # Phase 4: RESET
-        # Fresh state is automatic (new process = fresh registers)
-        # Matches Xilinx GSR behavior. For Intel behavior (no auto reset),
-        # user must design reset logic into their RM.
+        # RTL reset is enforced by the RM driver startup sequence
+        # (see generate_rm_driver_cpp — reset_cycles cycles driven before rm_ready=1).
+        # Python-side RESET phase is a state machine marker. reset_cycles and
+        # reset_behavior govern C++ codegen, not Python execution here.
         if not self.reset_complete():
             return False
 

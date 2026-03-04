@@ -19,7 +19,21 @@ CMD_NOOP = 0
 CMD_READ = 1
 CMD_WRITE = 2
 CMD_RECONFIG = 3
+CMD_BATCH = 4
 CMD_QUIT = 0xFF
+
+# Batch command constants
+MAX_BATCH = 32
+OFFSET_BATCH_COUNT = 48       # uint32_t at offset 48 in ShmMailbox
+OFFSET_BATCH_SLOTS = 56       # batch slot array starts at offset 56
+BATCH_SLOT_SIZE = 32           # sizeof(ShmBatchSlot) = 32 bytes
+# Offsets within each ShmBatchSlot:
+BATCH_SLOT_CMD = 0
+BATCH_SLOT_TARGET = 4
+BATCH_SLOT_PORT_IDX = 8
+# pad at 12
+BATCH_SLOT_WRITE_VALUE = 16
+BATCH_SLOT_READ_VALUE = 24
 
 # Simulation status (must match shm_mailbox.h)
 SIM_STATUS_INIT = 0
@@ -251,6 +265,59 @@ class SharedMemoryInterface:
         """
         self._send_command(CMD_RECONFIG, rm_idx=rm_idx, poll_timeout=poll_timeout)
         logger.info(f"Reconfiguration complete: target={self.target}, rm_idx={rm_idx}")
+
+    def _write_batch_slot(self, slot_idx: int, cmd: int, target: int,
+                          port_idx: int, write_value: int = 0):
+        """Write a single batch slot."""
+        base = OFFSET_BATCH_SLOTS + slot_idx * BATCH_SLOT_SIZE
+        self._write_u32(base + BATCH_SLOT_CMD, cmd)
+        self._write_u32(base + BATCH_SLOT_TARGET, target)
+        self._write_u32(base + BATCH_SLOT_PORT_IDX, port_idx)
+        self._write_u64(base + BATCH_SLOT_WRITE_VALUE, write_value)
+
+    def _read_batch_slot_result(self, slot_idx: int) -> int:
+        """Read the read_value result from a batch slot."""
+        base = OFFSET_BATCH_SLOTS + slot_idx * BATCH_SLOT_SIZE
+        return self._read_u64(base + BATCH_SLOT_READ_VALUE)
+
+    def batch_read_write(self, ops: list, poll_timeout: float = 10.0) -> list:
+        """
+        Send up to MAX_BATCH read/write commands in a single cycle.
+
+        Parameters
+        ----------
+        ops : list of (cmd, port_idx, write_value) tuples
+            cmd: CMD_READ or CMD_WRITE
+        poll_timeout : float
+            Timeout for waiting for batch response.
+
+        Returns
+        -------
+        list of int
+            Results for each op (read_value for CMD_READ, 0 for CMD_WRITE).
+        """
+        if self._closed:
+            raise RuntimeError("SharedMemoryInterface is closed")
+        if len(ops) > MAX_BATCH:
+            raise ValueError(f"Too many batch ops: {len(ops)} > {MAX_BATCH}")
+
+        for i, (cmd, port_idx, write_value) in enumerate(ops):
+            self._write_batch_slot(i, cmd, self.target, port_idx,
+                                   int(write_value) & 0xFFFFFFFFFFFFFFFF)
+
+        self._write_u32(OFFSET_BATCH_COUNT, len(ops))
+        self._write_u32(OFFSET_CMD, CMD_BATCH)  # trigger — written LAST
+
+        start = time.time()
+        while self._read_u32(OFFSET_CMD) != CMD_NOOP:
+            if time.time() - start > poll_timeout:
+                raise TimeoutError("Timeout waiting for batch command response")
+            time.sleep(0.0001)
+
+        return [
+            self._read_batch_slot_result(i) if cmd == CMD_READ else 0
+            for i, (cmd, _, _) in enumerate(ops)
+        ]
 
     def quit(self):
         """Send quit command to simulation."""

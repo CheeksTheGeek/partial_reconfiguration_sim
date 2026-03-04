@@ -265,6 +265,7 @@ def _validate_boundary_with_pyslang(
                     name=port.name,
                     width=rtl_width,
                     direction=port.direction,
+                    clock=port.clock,
                 ))
             else:
                 corrected_ports.append(port)
@@ -284,7 +285,9 @@ def _validate_boundary_with_pyslang(
         partition_name=boundary.partition_name,
         rm_module_name=boundary.rm_module_name,
         ports=corrected_ports,
-        clock_name=boundary.clock_name,
+        clock_names=boundary.clock_names,
+        reset_name=boundary.reset_name,
+        reset_polarity=boundary.reset_polarity,
     )
 
 
@@ -363,11 +366,16 @@ class VerilatorBuilder:
         name: str,
         index: int,
         rm_module_name: str,
-        clock_name: str,
-        to_rm_ports: List[Dict[str, Any]],
-        from_rm_ports: List[Dict[str, Any]],
-        rm_variants: List[Dict[str, Any]],
+        clock_name: str = 'clk',
+        clock_names: List[str] = None,
+        to_rm_ports: List[Dict[str, Any]] = None,
+        from_rm_ports: List[Dict[str, Any]] = None,
+        rm_variants: List[Dict[str, Any]] = None,
         initial_rm_index: int = 0,
+        reset_name: str = None,
+        reset_polarity: str = 'negative',
+        reset_cycles: int = 10,
+        reset_behavior: str = 'fresh',
     ):
         """
         Register a partition with its boundary ports and RM variants.
@@ -381,7 +389,9 @@ class VerilatorBuilder:
         rm_module_name : str
             Module name of the RM in the static region.
         clock_name : str
-            Clock signal name.
+            Primary clock signal name (backward compat).
+        clock_names : list of str, optional
+            All clock names. Supersedes clock_name if provided.
         to_rm_ports : list of dict
             Ports going from static to RM [{name, width}, ...].
         from_rm_ports : list of dict
@@ -390,16 +400,33 @@ class VerilatorBuilder:
             RM variants [{name, design, wrapper_name, index, sources, include_dirs}, ...].
         initial_rm_index : int
             Index of the initial RM to load.
+        reset_name : str, optional
+            Reset signal name (e.g. 'rst_n'). None = no reset port.
+        reset_polarity : str
+            'negative' (active-low) or 'positive' (active-high).
+        reset_cycles : int
+            Number of clock cycles to hold reset before rm_ready.
+        reset_behavior : str
+            'fresh', 'gsr_xilinx', or 'none_intel'.
         """
+        to_rm_ports = to_rm_ports or []
+        from_rm_ports = from_rm_ports or []
+        rm_variants = rm_variants or []
+        effective_clocks = clock_names if clock_names is not None else [clock_name]
+
         part_info = PartitionInfo(
             name=name,
             index=index,
             rm_module_name=rm_module_name,
-            clock_name=clock_name,
+            clock_names=effective_clocks,
             to_rm_ports=to_rm_ports,
             from_rm_ports=from_rm_ports,
             rm_variants=rm_variants,
             initial_rm_index=initial_rm_index,
+            reset_name=reset_name,
+            reset_polarity=reset_polarity,
+            reset_cycles=reset_cycles,
+            reset_behavior=reset_behavior,
         )
         self._partitions.append(part_info)
 
@@ -407,18 +434,22 @@ class VerilatorBuilder:
         boundary_ports = []
         for p in to_rm_ports:
             boundary_ports.append(BoundaryPort(
-                name=p['name'], width=p['width'], direction='to_rm'
+                name=p['name'], width=p['width'], direction='to_rm',
+                clock=p.get('clock'),
             ))
         for p in from_rm_ports:
             boundary_ports.append(BoundaryPort(
-                name=p['name'], width=p['width'], direction='from_rm'
+                name=p['name'], width=p['width'], direction='from_rm',
+                clock=p.get('clock'),
             ))
 
         self._partition_boundaries[name] = PartitionBoundaryDef(
             partition_name=name,
             rm_module_name=rm_module_name,
             ports=boundary_ports,
-            clock_name=clock_name,
+            clock_names=effective_clocks,
+            reset_name=reset_name,
+            reset_polarity=reset_polarity,
         )
 
         # Track RM->partition mapping

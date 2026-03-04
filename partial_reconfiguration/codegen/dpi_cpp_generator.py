@@ -25,12 +25,21 @@ class PartitionInfo:
     name: str
     index: int  # 0-based partition index
     rm_module_name: str  # Default RM module name (for bridge)
-    clock_name: str
+    clock_names: List[str]  # All clocks for this partition
     to_rm_ports: List[Dict[str, Any]]  # [{name, width}, ...]
     from_rm_ports: List[Dict[str, Any]]
     rm_variants: List[Dict[str, Any]] = field(default_factory=list)
     # [{name, design, wrapper_name, index}, ...]
     initial_rm_index: int = 0
+    reset_name: Optional[str] = None
+    reset_polarity: str = 'negative'
+    reset_cycles: int = 10
+    reset_behavior: str = 'fresh'  # 'fresh', 'gsr_xilinx', 'none_intel'
+
+    @property
+    def clock_name(self) -> str:
+        """Backward-compat: primary clock."""
+        return self.clock_names[0]
 
 
 @dataclass
@@ -42,32 +51,56 @@ class StaticInfo:
     clock_name: str = 'clk'
 
 
+def _num_chunks(width: int) -> int:
+    """Number of 64-bit SHM slots needed for a port of the given width."""
+    return (width + 63) // 64
+
+
+def _chunk_width(port_width: int, chunk_idx: int) -> int:
+    """Return the effective bit width of a specific chunk."""
+    lo = chunk_idx * 64
+    hi = min(lo + 63, port_width - 1)
+    return hi - lo + 1
+
+
+def _slot_offsets(ports: List[Dict]) -> List[int]:
+    """Return the starting slot index for each port in the list."""
+    offsets, idx = [], 0
+    for p in ports:
+        offsets.append(idx)
+        idx += _num_chunks(p.get('width', 32))
+    return offsets
+
+
+def _total_slots(ports: List[Dict]) -> int:
+    """Total number of SHM slots for a port list."""
+    return sum(_num_chunks(p.get('width', 32)) for p in ports)
+
+
 def _cpp_type(width: int) -> str:
-    """Select the C++ type that matches the DPI-C type for a given bit width."""
+    """Select the C++ type that matches the DPI-C type for a given bit width (per-chunk)."""
     if width <= 32:
         return 'int'
-    elif width <= 64:
-        return 'long long'
     else:
-        raise ValueError(f"Port width {width} exceeds 64 bits")
+        return 'long long'
 
 
 def _cpp_unsigned_type(width: int) -> str:
-    """Select the unsigned C++ storage type for a given bit width."""
+    """Select the unsigned C++ storage type for a given bit width (per-chunk)."""
     if width <= 32:
         return 'uint32_t'
-    elif width <= 64:
-        return 'uint64_t'
     else:
-        raise ValueError(f"Port width {width} exceeds 64 bits")
+        return 'uint64_t'
 
 
 def _mask_expr(width: int) -> str:
     """Generate a C++ mask expression for the given bit width, or empty if full-width."""
-    if width >= 32 and width <= 32:
+    if width == 32:
         return ''
-    if width >= 64:
+    if width == 64:
         return ''
+    if width > 64:
+        return ''  # callers use per-chunk widths; this shouldn't be called for >64
     if width < 32:
         mask = (1 << width) - 1
         return f" & 0x{mask:X}u"
@@ -165,8 +198,10 @@ class DpiCppGenerator:
         lines.append("//   Total: 64 + T*192 + F*128 bytes, page-aligned")
         lines.append("")
 
-        lines.append("static inline size_t shm_partition_size(uint32_t T, uint32_t F) {")
-        lines.append("    size_t raw = 64 + (size_t)T * 192 + (size_t)F * 128;")
+        lines.append("// T_slots and F_slots are slot counts (not port counts).")
+        lines.append("// A port of width W occupies ceil(W/64) slots.")
+        lines.append("static inline size_t shm_partition_size(uint32_t T_slots, uint32_t F_slots) {")
+        lines.append("    size_t raw = 64 + (size_t)T_slots * 192 + (size_t)F_slots * 128;")
         lines.append("    return (raw + 4095) & ~(size_t)4095;  // round to page")
         lines.append("}")
         lines.append("")
@@ -282,7 +317,11 @@ class DpiCppGenerator:
         lines.append("#define CMD_READ     1")
         lines.append("#define CMD_WRITE    2")
         lines.append("#define CMD_RECONFIG 3")
+        lines.append("#define CMD_BATCH    4")
         lines.append("#define CMD_QUIT     0xFF")
+        lines.append("")
+        lines.append("// Batch command limits")
+        lines.append("#define MAX_BATCH    32")
         lines.append("")
         lines.append("// Simulation status")
         lines.append("#define SIM_STATUS_INIT    0")
@@ -294,6 +333,15 @@ class DpiCppGenerator:
         lines.append("#define TARGET_STATIC 0")
         lines.append("// Partition targets: 1, 2, 3, ... (1-based)")
         lines.append("")
+        lines.append("struct ShmBatchSlot {")
+        lines.append("    uint32_t cmd;          // CMD_READ or CMD_WRITE")
+        lines.append("    uint32_t target;")
+        lines.append("    uint32_t port_idx;")
+        lines.append("    uint32_t _pad;")
+        lines.append("    uint64_t write_value;")
+        lines.append("    uint64_t read_value;   // written by C++ for CMD_READ")
+        lines.append("};")
+        lines.append("")
         lines.append("struct ShmMailbox {")
         lines.append("    volatile uint32_t sim_status;     // SIM_STATUS_*")
         lines.append("    uint32_t _pad0;")
@@ -304,6 +352,10 @@ class DpiCppGenerator:
         lines.append("    volatile uint32_t rm_idx;         // RM index for reconfig")
         lines.append("    volatile uint64_t write_value;    // Value for write commands")
         lines.append("    volatile uint64_t read_value;     // Value from read commands")
+        lines.append("    // Batch command extension (offset 48)")
+        lines.append("    volatile uint32_t batch_count;    // Number of batch slots used")
+        lines.append("    uint32_t _pad1;")
+        lines.append("    ShmBatchSlot batch[MAX_BATCH];    // 32 slots x 32 bytes = 1024 bytes")
         lines.append("};")
         lines.append("")
         lines.append("#endif // SHM_MAILBOX_H")
@@ -360,25 +412,34 @@ class DpiCppGenerator:
         lines.append("}")
         lines.append("")
 
-        # Per-partition read/write via shared memory
+        # Per-partition read/write via shared memory (slot-based indexing)
         for part in partitions:
-            num_to_rm = len(part.to_rm_ports)
+            to_offsets = _slot_offsets(part.to_rm_ports)
+            num_to_rm_slots = _total_slots(part.to_rm_ports)
 
             lines.append(f"inline uint64_t read_{part.name}_port(int port_idx) {{")
             lines.append(f"    void* base = g_partition_bases[{part.index}];")
             lines.append(f"    ShmPartitionHeader* hdr = shm_header(base);")
             lines.append("    switch (port_idx) {")
-            idx = 0
+            # to_rm slots: each slot has override + inbox
+            slot_idx = 0
             for i, port in enumerate(part.to_rm_ports):
-                lines.append(f"        case {idx}: {{")
-                lines.append(f"            ShmPortOverride* ovr = shm_to_rm_override(base, {i});")
-                lines.append(f"            if (shm_load32(&ovr->active)) return shm_load64_relaxed(&ovr->value);")
-                lines.append(f"            return shm_load64_relaxed(&shm_to_rm_inbox(base, {i})->data);")
-                lines.append(f"        }}")
-                idx += 1
+                nc = _num_chunks(port.get('width', 32))
+                for c in range(nc):
+                    lines.append(f"        case {slot_idx}: {{")
+                    lines.append(f"            ShmPortOverride* ovr = shm_to_rm_override(base, {slot_idx});")
+                    lines.append(f"            if (shm_load32(&ovr->active)) return shm_load64_relaxed(&ovr->value);")
+                    lines.append(f"            return shm_load64_relaxed(&shm_to_rm_inbox(base, {slot_idx})->data);")
+                    lines.append(f"        }}")
+                    slot_idx += 1
+            # from_rm slots: read from outbox
+            from_slot_idx = 0
             for i, port in enumerate(part.from_rm_ports):
-                lines.append(f"        case {idx}: return shm_load64_relaxed(&shm_from_rm_outbox(base, hdr->num_to_rm, {i})->data);")
-                idx += 1
+                nc = _num_chunks(port.get('width', 32))
+                for c in range(nc):
+                    lines.append(f"        case {slot_idx}: return shm_load64_relaxed(&shm_from_rm_outbox(base, hdr->num_to_rm, {from_slot_idx})->data);")
+                    slot_idx += 1
+                    from_slot_idx += 1
             lines.append("        default: return 0;")
             lines.append("    }")
             lines.append("}")
@@ -387,15 +448,17 @@ class DpiCppGenerator:
             lines.append(f"inline void write_{part.name}_port(int port_idx, uint64_t value) {{")
             lines.append(f"    void* base = g_partition_bases[{part.index}];")
             lines.append("    switch (port_idx) {")
-            idx = 0
+            slot_idx = 0
             for i, port in enumerate(part.to_rm_ports):
-                lines.append(f"        case {idx}: {{")
-                lines.append(f"            ShmPortOverride* ovr = shm_to_rm_override(base, {i});")
-                lines.append(f"            shm_store64_relaxed(&ovr->value, value);")
-                lines.append(f"            shm_store32(&ovr->active, 1);")
-                lines.append(f"            break;")
-                lines.append(f"        }}")
-                idx += 1
+                nc = _num_chunks(port.get('width', 32))
+                for c in range(nc):
+                    lines.append(f"        case {slot_idx}: {{")
+                    lines.append(f"            ShmPortOverride* ovr = shm_to_rm_override(base, {slot_idx});")
+                    lines.append(f"            shm_store64_relaxed(&ovr->value, value);")
+                    lines.append(f"            shm_store32(&ovr->active, 1);")
+                    lines.append(f"            break;")
+                    lines.append(f"        }}")
+                    slot_idx += 1
             # from_rm ports are read-only from Python
             lines.append("        default: break;")
             lines.append("    }")
@@ -533,6 +596,39 @@ class DpiCppGenerator:
         lines.append("            reconfig_partition = part_id;")
         lines.append("        }")
         lines.append("        // Don't set cmd=NOOP yet — Python waits until reconfig completes")
+        lines.append("        break;")
+        lines.append("    }")
+        lines.append("    case CMD_BATCH: {")
+        lines.append("        uint32_t n = mailbox->batch_count;")
+        lines.append("        if (n > MAX_BATCH) n = MAX_BATCH;")
+        lines.append("        for (uint32_t b = 0; b < n; b++) {")
+        lines.append("            ShmBatchSlot* slot = &mailbox->batch[b];")
+        lines.append("            switch (slot->cmd) {")
+        lines.append("            case CMD_READ: {")
+        lines.append("                uint64_t val = 0;")
+        lines.append("                if (slot->target == TARGET_STATIC) {")
+        lines.append("                    val = read_static_port(static_model, slot->port_idx);")
+        lines.append("                }")
+        for part in partitions:
+            lines.append(f"                else if (slot->target == {part.index + 1}) {{")
+            lines.append(f"                    val = read_{part.name}_port(slot->port_idx);")
+            lines.append(f"                }}")
+        lines.append("                slot->read_value = val;")
+        lines.append("                break;")
+        lines.append("            }")
+        lines.append("            case CMD_WRITE: {")
+        lines.append("                if (slot->target == TARGET_STATIC) {")
+        lines.append("                    write_static_port(static_model, slot->port_idx, slot->write_value);")
+        lines.append("                }")
+        for part in partitions:
+            lines.append(f"                else if (slot->target == {part.index + 1}) {{")
+            lines.append(f"                    write_{part.name}_port(slot->port_idx, slot->write_value);")
+            lines.append(f"                }}")
+        lines.append("                break;")
+        lines.append("            }")
+        lines.append("            }")
+        lines.append("        }")
+        lines.append("        mailbox->cmd = CMD_NOOP;")
         lines.append("        break;")
         lines.append("    }")
         lines.append("    case CMD_QUIT:")
@@ -784,28 +880,49 @@ class DpiCppGenerator:
         lines.append(f"    auto model = new {model_type}(ctx);")
         lines.append("")
 
-        # Init barrier sense and signal ready
+        # Init barrier sense
         lines.append("    // Init barrier sense from current global sense")
         lines.append("    uint32_t local_sense = __atomic_load_n(&barrier->sense, __ATOMIC_ACQUIRE);")
         lines.append("")
+
+        # Reset assertion before rm_ready (if configured)
+        if part.reset_name is not None and part.reset_behavior != 'none_intel':
+            assert_val = 0 if part.reset_polarity == 'negative' else 1
+            deassert_val = 1 if part.reset_polarity == 'negative' else 0
+            lines.append(f"    // Assert reset for {part.reset_cycles} cycles before signaling ready")
+            lines.append(f"    model->{part.reset_name} = {assert_val};")
+            lines.append(f"    for (int rst_cycle = 0; rst_cycle < {part.reset_cycles}; rst_cycle++) {{")
+            for clk in part.clock_names:
+                lines.append(f"        model->{clk} = 0;")
+            lines.append(f"        model->eval();")
+            for clk in part.clock_names:
+                lines.append(f"        model->{clk} = 1;")
+            lines.append(f"        model->eval();")
+            lines.append(f"    }}")
+            lines.append(f"    model->{part.reset_name} = {deassert_val};")
+            lines.append(f"    model->eval();")
+            lines.append("")
+
         lines.append("    // Signal ready to static binary")
         lines.append("    shm_store32(&g_channel_header->rm_ready, 1);")
         lines.append("")
 
-        # Main loop
+        # Main loop — use configured clock names
         lines.append("    // Main simulation loop")
         lines.append("    while (true) {")
         lines.append("        // Check quit before barrier (allows clean exit during reconfig)")
         lines.append("        if (shm_load32(&g_channel_header->quit))")
         lines.append("            break;")
         lines.append("")
-        lines.append("        model->clk = 0;")
+        for clk in part.clock_names:
+            lines.append(f"        model->{clk} = 0;")
         lines.append("        model->eval();")
         lines.append("        barrier_wait(barrier, &local_sense);  // 1: negedge done")
         lines.append("")
         lines.append("        barrier_wait(barrier, &local_sense);  // 2: swap done")
         lines.append("")
-        lines.append("        model->clk = 1;")
+        for clk in part.clock_names:
+            lines.append(f"        model->{clk} = 1;")
         lines.append("        model->eval();")
         lines.append("        barrier_wait(barrier, &local_sense);  // 3: posedge done")
         lines.append("    }")
@@ -841,31 +958,45 @@ class DpiCppGenerator:
         lines.append('extern "C" {')
         lines.append('')
 
-        # to_rm: static sends (write to outbox)
+        # to_rm: static sends (write to outbox) — chunked for wide ports
+        to_slot = 0
         for i, port in enumerate(part.to_rm_ports):
             w = port.get('width', 32)
-            ct = _cpp_type(w)
-            fname = f"dpi_static_{part.name}_{port['name']}_send"
-            lines.append(f"void {fname}({ct} data) {{")
-            lines.append(f"    ShmPort* p = shm_to_rm_outbox(g_partition_bases[{part.index}], {i});")
-            lines.append(f"    p->data = static_cast<uint64_t>(data{_mask_expr(w)});")
-            lines.append(f"    p->valid = 1;")
-            lines.append("}")
-            lines.append("")
+            nc = _num_chunks(w)
+            for c in range(nc):
+                cw = _chunk_width(w, c)
+                ct = _cpp_type(cw)
+                suffix = f"_chunk{c}_send" if nc > 1 else "_send"
+                fname = f"dpi_static_{part.name}_{port['name']}{suffix}"
+                lines.append(f"void {fname}({ct} data) {{")
+                lines.append(f"    ShmPort* p = shm_to_rm_outbox(g_partition_bases[{part.index}], {to_slot});")
+                lines.append(f"    p->data = static_cast<uint64_t>(data{_mask_expr(cw)});")
+                lines.append(f"    p->valid = 1;")
+                lines.append("}")
+                lines.append("")
+                to_slot += 1
 
-        # from_rm: static receives (read from inbox)
+        # from_rm: static receives (read from inbox) — chunked for wide ports
+        num_to_rm_slots = _total_slots(part.to_rm_ports)
+        from_slot = 0
         for i, port in enumerate(part.from_rm_ports):
             w = port.get('width', 32)
-            ct = _cpp_type(w)
-            ch_expr = f"shm_from_rm_inbox(g_partition_bases[{part.index}], {len(part.to_rm_ports)}, {i})"
-            lines.append(f"{ct} dpi_static_{part.name}_{port['name']}_recv_data() {{")
-            lines.append(f"    return static_cast<{ct}>({ch_expr}->data{_mask_expr(w)});")
-            lines.append("}")
-            lines.append("")
-            lines.append(f"int dpi_static_{part.name}_{port['name']}_recv_valid() {{")
-            lines.append(f"    return {ch_expr}->valid ? 1 : 0;")
-            lines.append("}")
-            lines.append("")
+            nc = _num_chunks(w)
+            for c in range(nc):
+                cw = _chunk_width(w, c)
+                ct = _cpp_type(cw)
+                suffix_d = f"_chunk{c}_recv_data" if nc > 1 else "_recv_data"
+                suffix_v = f"_chunk{c}_recv_valid" if nc > 1 else "_recv_valid"
+                ch_expr = f"shm_from_rm_inbox(g_partition_bases[{part.index}], {num_to_rm_slots}, {from_slot})"
+                lines.append(f"{ct} dpi_static_{part.name}_{port['name']}{suffix_d}() {{")
+                lines.append(f"    return static_cast<{ct}>({ch_expr}->data{_mask_expr(cw)});")
+                lines.append("}")
+                lines.append("")
+                lines.append(f"int dpi_static_{part.name}_{port['name']}{suffix_v}() {{")
+                lines.append(f"    return {ch_expr}->valid ? 1 : 0;")
+                lines.append("}")
+                lines.append("")
+                from_slot += 1
 
         lines.append("} // extern \"C\"")
 
@@ -891,39 +1022,52 @@ class DpiCppGenerator:
         lines.append('extern "C" {')
         lines.append('')
 
-        # to_rm: RM receives (read from inbox, check override)
+        # to_rm: RM receives (read from inbox, check override) — chunked for wide ports
+        to_slot = 0
         for i, port in enumerate(part.to_rm_ports):
             w = port.get('width', 32)
-            ct = _cpp_type(w)
-            inbox_expr = f"shm_to_rm_inbox(g_channel_base, {i})"
-            ovr_expr = f"shm_to_rm_override(g_channel_base, {i})"
+            nc = _num_chunks(w)
+            for c in range(nc):
+                cw = _chunk_width(w, c)
+                ct = _cpp_type(cw)
+                suffix_d = f"_chunk{c}_recv_data" if nc > 1 else "_recv_data"
+                suffix_v = f"_chunk{c}_recv_valid" if nc > 1 else "_recv_valid"
+                inbox_expr = f"shm_to_rm_inbox(g_channel_base, {to_slot})"
+                ovr_expr = f"shm_to_rm_override(g_channel_base, {to_slot})"
 
-            lines.append(f"{ct} dpi_rm_{part.name}_{port['name']}_recv_data() {{")
-            lines.append(f"    ShmPortOverride* ovr = {ovr_expr};")
-            lines.append(f"    if (shm_load32(&ovr->active))")
-            lines.append(f"        return static_cast<{ct}>(shm_load64_relaxed(&ovr->value){_mask_expr(w)});")
-            lines.append(f"    return static_cast<{ct}>({inbox_expr}->data{_mask_expr(w)});")
-            lines.append("}")
-            lines.append("")
-            lines.append(f"int dpi_rm_{part.name}_{port['name']}_recv_valid() {{")
-            lines.append(f"    ShmPortOverride* ovr = {ovr_expr};")
-            lines.append(f"    if (shm_load32(&ovr->active))")
-            lines.append(f"        return 1;")
-            lines.append(f"    return {inbox_expr}->valid ? 1 : 0;")
-            lines.append("}")
-            lines.append("")
+                lines.append(f"{ct} dpi_rm_{part.name}_{port['name']}{suffix_d}() {{")
+                lines.append(f"    ShmPortOverride* ovr = {ovr_expr};")
+                lines.append(f"    if (shm_load32(&ovr->active))")
+                lines.append(f"        return static_cast<{ct}>(shm_load64_relaxed(&ovr->value){_mask_expr(cw)});")
+                lines.append(f"    return static_cast<{ct}>({inbox_expr}->data{_mask_expr(cw)});")
+                lines.append("}")
+                lines.append("")
+                lines.append(f"int dpi_rm_{part.name}_{port['name']}{suffix_v}() {{")
+                lines.append(f"    ShmPortOverride* ovr = {ovr_expr};")
+                lines.append(f"    if (shm_load32(&ovr->active))")
+                lines.append(f"        return 1;")
+                lines.append(f"    return {inbox_expr}->valid ? 1 : 0;")
+                lines.append("}")
+                lines.append("")
+                to_slot += 1
 
-        # from_rm: RM sends (write to outbox)
+        # from_rm: RM sends (write to outbox) — chunked for wide ports
+        from_slot = 0
         for i, port in enumerate(part.from_rm_ports):
             w = port.get('width', 32)
-            ct = _cpp_type(w)
-            ch_expr = f"shm_from_rm_outbox(g_channel_base, g_channel_header->num_to_rm, {i})"
-            lines.append(f"void dpi_rm_{part.name}_{port['name']}_send({ct} data) {{")
-            lines.append(f"    ShmPort* p = {ch_expr};")
-            lines.append(f"    p->data = static_cast<uint64_t>(data{_mask_expr(w)});")
-            lines.append(f"    p->valid = 1;")
-            lines.append("}")
-            lines.append("")
+            nc = _num_chunks(w)
+            for c in range(nc):
+                cw = _chunk_width(w, c)
+                ct = _cpp_type(cw)
+                suffix = f"_chunk{c}_send" if nc > 1 else "_send"
+                ch_expr = f"shm_from_rm_outbox(g_channel_base, g_channel_header->num_to_rm, {from_slot})"
+                lines.append(f"void dpi_rm_{part.name}_{port['name']}{suffix}({ct} data) {{")
+                lines.append(f"    ShmPort* p = {ch_expr};")
+                lines.append(f"    p->data = static_cast<uint64_t>(data{_mask_expr(cw)});")
+                lines.append(f"    p->valid = 1;")
+                lines.append("}")
+                lines.append("")
+                from_slot += 1
 
         lines.append("} // extern \"C\"")
 

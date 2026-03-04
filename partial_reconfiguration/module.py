@@ -215,21 +215,23 @@ class ReconfigurableModule:
             port_specs = []
             idx = 0
             for port in to_rm_ports:
+                w = port.get('width', 1)
                 port_specs.append(PortSpec(
                     name=port['name'],
-                    width=port.get('width', 1),
+                    width=w,
                     direction='to_rm',
                     index=idx,
                 ))
-                idx += 1
+                idx += (w + 63) // 64  # advance by num_chunks
             for port in from_rm_ports:
+                w = port.get('width', 1)
                 port_specs.append(PortSpec(
                     name=port['name'],
-                    width=port.get('width', 1),
+                    width=w,
                     direction='from_rm',
                     index=idx,
                 ))
-                idx += 1
+                idx += (w + 63) // 64  # advance by num_chunks
 
             return port_specs
 

@@ -630,7 +630,14 @@ class PRSystem:
 
             partition_name = part_cfg['name']
             rm_module = part_cfg.get('rm_module')
-            clock_name = part_cfg.get('clock', 'clk')
+            clock_names = part_cfg.get('clocks', [part_cfg.get('clock', 'clk')])
+
+            # Reset config from partition
+            resets = part_cfg.get('resets', [])
+            reset_name = resets[0]['name'] if resets else None
+            reset_polarity = resets[0].get('polarity', 'negative') if resets else 'negative'
+            reset_cycles = part_cfg.get('reset_cycles', 10)
+            reset_behavior = part_cfg.get('reset_behavior', 'fresh')
 
             if not rm_module:
                 logger.warning(
@@ -676,11 +683,15 @@ class PRSystem:
                 name=partition_name,
                 index=part_idx,
                 rm_module_name=rm_module,
-                clock_name=clock_name,
+                clock_names=clock_names,
                 to_rm_ports=to_rm_ports,
                 from_rm_ports=from_rm_ports,
                 rm_variants=rm_variants,
                 initial_rm_index=initial_rm_index,
+                reset_name=reset_name,
+                reset_polarity=reset_polarity,
+                reset_cycles=reset_cycles,
+                reset_behavior=reset_behavior,
             )
 
             # Store partition index for shared memory targeting
@@ -747,14 +758,15 @@ class PRSystem:
         partition_configs = []
         for part_name, partition in self.partitions.items():
             part_idx = getattr(partition, '_partition_index', 0)
-            # Count to_rm and from_rm ports from the builder partition info
+            # Count to_rm and from_rm SLOTS (not ports) from the builder partition info
+            # A port of width W occupies ceil(W/64) slots.
             num_to_rm = 0
             num_from_rm = 0
             if self._builder:
                 for pi in self._builder._partitions:
                     if pi.name == part_name:
-                        num_to_rm = len(pi.to_rm_ports)
-                        num_from_rm = len(pi.from_rm_ports)
+                        num_to_rm = sum((p.get('width', 32) + 63) // 64 for p in pi.to_rm_ports)
+                        num_from_rm = sum((p.get('width', 32) + 63) // 64 for p in pi.from_rm_ports)
                         break
             partition_configs.append({
                 'name': part_name,

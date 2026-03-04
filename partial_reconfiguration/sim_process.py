@@ -34,7 +34,11 @@ SHM_VERSION = 1
 
 
 def _compute_partition_shm_size(num_to_rm: int, num_from_rm: int) -> int:
-    """Compute the page-aligned shared memory size for a partition channel."""
+    """Compute the page-aligned shared memory size for a partition channel.
+
+    Parameters are slot counts (not port counts). A port of width W
+    occupies ceil(W/64) slots.
+    """
     raw = 64 + num_to_rm * 192 + num_from_rm * 128
     return (raw + 4095) & ~4095
 
