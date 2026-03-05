@@ -64,3 +64,4 @@ __pycache__
 
 # i like it like this
 uv.lock
+examples/**/sim_build

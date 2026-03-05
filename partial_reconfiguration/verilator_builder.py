@@ -21,6 +21,7 @@ from .codegen.dpi_bridge_generator import (
 )
 from .codegen.dpi_cpp_generator import DpiCppGenerator, PartitionInfo, StaticInfo
 from .codegen.makefile_generator import MakefileGenerator, ModuleBuildInfo, RmBinaryInfo
+from .codegen.cocotb_generator import CocotbGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -235,6 +236,120 @@ def _detect_clock_from_rtl(sources: List[str], module_name: str) -> Optional[str
         return None
 
 
+_RESET_ACTIVE_LOW_PATTERNS = (
+    'rst_n', 'rstn', 'reset_n', 'resetn', 'nreset', 'arst_n', 'rst_ni',
+)
+_RESET_ACTIVE_HIGH_PATTERNS = (
+    'rst', 'reset', 'arst', 'srst',
+)
+
+
+def _detect_reset_from_rtl(
+    sources: List[str],
+    module_name: str,
+    clock_name: str = None,
+) -> Optional[tuple]:
+    """
+    Use pyslang AST analysis to detect the reset signal from RTL.
+
+    Returns (reset_name, active_low: bool) or None if not found.
+
+    Detection strategy:
+      1. Walk all 1-bit input ports, exclude the known clock.
+      2. Look for negedge references in always blocks (active-low resets).
+      3. Name-pattern matching: *_n / *n variants → active-low, else active-high.
+      4. Return the best candidate.
+    """
+    try:
+        import pyslang
+    except ImportError:
+        return None
+
+    comp, _ = _slang_compile(sources)
+    if comp is None:
+        return None
+
+    try:
+        inst = _slang_find_instance(comp, module_name)
+        if inst is None:
+            return None
+
+        # Collect 1-bit input ports, excluding clock
+        candidates: List[str] = []
+        for member in inst.body:
+            if member.kind == pyslang.ast.SymbolKind.Port:
+                if member.direction != pyslang.ast.ArgumentDirection.In:
+                    continue
+                if member.internalSymbol.type.bitWidth != 1:
+                    continue
+                if member.name == clock_name:
+                    continue
+                candidates.append(member.name)
+
+        if not candidates:
+            return None
+
+        # Strategy 1: look for negedge signals in always blocks → active-low
+        negedge_sigs: List[str] = []
+        for member in inst.body:
+            if member.kind != pyslang.ast.SymbolKind.ProceduralBlock:
+                continue
+            body = member.body
+            if body.kind != pyslang.ast.StatementKind.Timed:
+                continue
+            tc = body.timing
+            if tc.kind == pyslang.ast.TimingControlKind.SignalEvent:
+                if tc.edge == pyslang.ast.EdgeKind.NegEdge:
+                    sym = tc.expr.getSymbolReference()
+                    if sym is not None and sym.name not in negedge_sigs:
+                        negedge_sigs.append(sym.name)
+            elif tc.kind == pyslang.ast.TimingControlKind.EventList:
+                for event in tc.events:
+                    if event.edge == pyslang.ast.EdgeKind.NegEdge:
+                        sym = event.expr.getSymbolReference()
+                        if sym is not None and sym.name not in negedge_sigs:
+                            negedge_sigs.append(sym.name)
+
+        # Negedge candidates that are 1-bit inputs (not the clock) → active-low
+        negedge_resets = [s for s in negedge_sigs if s in candidates]
+        if negedge_resets:
+            name = negedge_resets[0]
+            logger.info(
+                f"pyslang: '{name}' detected as active-low reset "
+                f"via negedge analysis in {module_name}"
+            )
+            return name, True
+
+        # Strategy 2: name-pattern matching
+        for name in candidates:
+            nl = name.lower()
+            if nl in _RESET_ACTIVE_LOW_PATTERNS or nl.endswith('_n') or nl.endswith('n'):
+                logger.info(
+                    f"pyslang: '{name}' matches active-low reset pattern in {module_name}"
+                )
+                return name, True
+
+        for name in candidates:
+            nl = name.lower()
+            if nl in _RESET_ACTIVE_HIGH_PATTERNS or 'rst' in nl or 'reset' in nl:
+                logger.info(
+                    f"pyslang: '{name}' matches active-high reset pattern in {module_name}"
+                )
+                return name, False
+
+        # Strategy 3: first remaining 1-bit input after clock
+        name = candidates[0]
+        logger.warning(
+            f"pyslang: guessing '{name}' as reset for {module_name} "
+            f"(no pattern match)"
+        )
+        return name, True  # assume active-low by convention
+
+    except Exception as e:
+        logger.debug(f"pyslang reset detection failed for '{module_name}': {e}")
+        return None
+
+
 def _validate_boundary_with_pyslang(
     boundary: PartitionBoundaryDef,
     rm_sources: List[str],
@@ -312,6 +427,8 @@ class VerilatorBuilder:
 
         # Registered modules
         self._static_design: Optional[str] = None
+        self._static_reset_name: Optional[str] = None
+        self._static_reset_active_low: bool = True
         self._static_sources: List[str] = []
         self._static_include_dirs: List[str] = []
         self._static_ports: List[Dict[str, Any]] = []
@@ -326,9 +443,11 @@ class VerilatorBuilder:
         self._bridge_gen = DpiBridgeGenerator(build_dir=str(self.build_dir))
         self._cpp_gen = DpiCppGenerator(build_dir=str(self.build_dir))
         self._make_gen = MakefileGenerator(build_dir=str(self.build_dir))
+        self._cocotb_gen = CocotbGenerator(build_dir=str(self.build_dir))
 
         # Populated after build
         self._binary_paths: Dict[str, Path] = {}
+        self._cocotb_files: Dict[str, Path] = {}  # populated in cocotb_mode
 
     def set_static_region(
         self,
@@ -337,6 +456,8 @@ class VerilatorBuilder:
         ports: List[Dict[str, Any]] = None,
         include_dirs: List[str] = None,
         clock_name: str = 'clk',
+        reset_name: str = None,
+        reset_active_low: bool = True,
     ):
         """
         Register the static region module.
@@ -360,6 +481,8 @@ class VerilatorBuilder:
         self._static_ports = ports or []
         self._static_include_dirs = include_dirs or []
         self._static_clock_name = clock_name
+        self._static_reset_name = reset_name
+        self._static_reset_active_low = reset_active_low
 
     def add_partition(
         self,
@@ -456,24 +579,34 @@ class VerilatorBuilder:
         for rm in rm_variants:
             self._rm_partition_map[rm['name']] = name
 
-    def build(self) -> Dict[str, Path]:
+    def build(self, cocotb_mode: bool = False) -> Dict[str, Path]:
         """
         Execute the full build pipeline.
 
         1. Generate DPI bridges (SV) for each partition
         2. Generate DPI C++ code (multi-binary architecture)
-        3. Generate Makefile (multi-binary targets)
-        4. Run make to verilate, compile, and link
+        3. Generate cocotb wrapper files (if cocotb_mode)
+        4. Generate Makefile (rm_only in cocotb_mode)
+        5. Run make to verilate, compile, and link
+
+        Parameters
+        ----------
+        cocotb_mode : bool
+            When True, skip static binary build. Generate cocotb wrapper
+            files (pr_cocotb_top.sv, pr_cocotb_barrier.cpp) instead.
+            cocotb handles static region compilation.
 
         Returns
         -------
         dict
             Binary paths: {'static': Path, 'rm/{name}': Path, ...}
+            In cocotb_mode, 'static' key is absent.
         """
         if self._static_design is None:
             raise RuntimeError("No static region registered. Call set_static_region() first.")
 
-        logger.info("=== Build Pipeline Starting ===")
+        mode_str = " (cocotb mode)" if cocotb_mode else ""
+        logger.info(f"=== Build Pipeline Starting{mode_str} ===")
 
         # Step 1: Generate DPI bridges and wrappers
         logger.info("Step 1: Generating DPI bridges and wrappers...")
@@ -485,6 +618,8 @@ class VerilatorBuilder:
             design_name=self._static_design,
             ports=self._static_ports,
             clock_name=self._static_clock_name,
+            reset_name=self._static_reset_name,
+            reset_active_low=self._static_reset_active_low,
         )
         self._cpp_gen.generate_all(
             partitions=self._partitions,
@@ -493,16 +628,29 @@ class VerilatorBuilder:
             trace_type=self.trace_type,
         )
 
-        # Step 3: Generate Makefile
-        logger.info("Step 3: Generating Makefile...")
-        self._generate_makefile()
+        # Step 2b: Generate cocotb integration files (if cocotb_mode)
+        if cocotb_mode:
+            logger.info("Step 2b: Generating cocotb integration files...")
+            self._cocotb_files = self._cocotb_gen.generate_all(
+                partitions=self._partitions,
+                static_info=static_info,
+            )
 
-        # Step 4: Run make
-        logger.info("Step 4: Running make...")
-        self._run_make()
+        # Step 3: Generate Makefile (rm_only in cocotb_mode)
+        logger.info("Step 3: Generating Makefile...")
+        self._generate_makefile(rm_only=cocotb_mode)
+
+        # Step 4: Run make (only RM binaries if cocotb_mode)
+        if self._partitions:
+            logger.info("Step 4: Running make...")
+            self._run_make()
+        else:
+            logger.info("Step 4: No partitions to build, skipping make")
 
         # Collect binary paths
-        self._binary_paths = {'static': self.build_dir / 'static_binary'}
+        self._binary_paths = {}
+        if not cocotb_mode:
+            self._binary_paths['static'] = self.build_dir / 'static_binary'
         for part_info in self._partitions:
             for rm in part_info.rm_variants:
                 rm_name = rm['name']
@@ -528,6 +676,11 @@ class VerilatorBuilder:
     def get_rm_binary_path(self, rm_name: str) -> Optional[Path]:
         """Get path to a specific RM binary."""
         return self._binary_paths.get(f"rm/{rm_name}")
+
+    @property
+    def cocotb_files(self) -> Dict[str, Path]:
+        """Get cocotb integration file paths (available after cocotb_mode build)."""
+        return dict(self._cocotb_files)
 
     def _generate_bridges(self):
         """Generate DPI bridge SV files and register RM module build info."""
@@ -578,7 +731,7 @@ class VerilatorBuilder:
                     obj_dir_prefix=f"rm/{rm['name']}/",
                 )
 
-    def _generate_makefile(self):
+    def _generate_makefile(self, rm_only: bool = False):
         """Generate the multi-binary Makefile."""
         # Static module build info
         static_module = ModuleBuildInfo(
@@ -619,6 +772,7 @@ class VerilatorBuilder:
             static_driver_cpp=static_driver_cpp,
             trace=self.trace,
             trace_type=self.trace_type,
+            rm_only=rm_only,
         )
 
     def _run_make(self):

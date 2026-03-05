@@ -49,6 +49,8 @@ class StaticInfo:
     ports: List[Dict[str, Any]]  # [{name, width, direction}, ...]
     # direction: 'input' or 'output'
     clock_name: str = 'clk'
+    reset_name: str = None          # e.g. 'rst_n'; None = no reset port
+    reset_active_low: bool = True   # True = ACTIVE_LOW
 
 
 def _num_chunks(width: int) -> int:
@@ -911,8 +913,10 @@ class DpiCppGenerator:
         lines.append("    // Main simulation loop")
         lines.append("    while (true) {")
         lines.append("        // Check quit before barrier (allows clean exit during reconfig)")
-        lines.append("        if (shm_load32(&g_channel_header->quit))")
+        lines.append("        if (shm_load32(&g_channel_header->quit)) {")
+        lines.append("            shm_store32(&g_channel_header->rm_ready, 0);  // signal we are exiting")
         lines.append("            break;")
+        lines.append("        }")
         lines.append("")
         for clk in part.clock_names:
             lines.append(f"        model->{clk} = 0;")

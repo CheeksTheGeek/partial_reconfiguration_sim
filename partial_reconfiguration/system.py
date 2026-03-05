@@ -474,7 +474,7 @@ class PRSystem:
         self._validated = True
         return True
 
-    def build(self, fast: bool = False) -> 'PRSystem':
+    def build(self, fast: bool = False, cocotb_mode: bool = False) -> 'PRSystem':
         """
         Build all simulation binaries (multi-binary architecture).
 
@@ -488,6 +488,9 @@ class PRSystem:
         ----------
         fast : bool
             Skip rebuild if static_binary exists
+        cocotb_mode : bool
+            When True, skip static binary build. Generate cocotb wrapper
+            files instead. cocotb handles static region compilation.
 
         Returns
         -------
@@ -520,7 +523,7 @@ class PRSystem:
         )
 
         self._setup_builder()
-        self._binary_paths = self._builder.build()
+        self._binary_paths = self._builder.build(cocotb_mode=cocotb_mode)
 
         # Build static region and RMs AFTER builder (generates API classes
         # for get_api()). Must be after _setup_builder() which populates
@@ -608,16 +611,27 @@ class PRSystem:
         ]
 
         # Detect clock name: pyslang RTL analysis > config > default 'clk'
-        from .verilator_builder import _detect_clock_from_rtl
+        from .verilator_builder import _detect_clock_from_rtl, _detect_reset_from_rtl
         static_clock = _detect_clock_from_rtl(static_sources, static_design)
         if static_clock is None:
             static_clock = self._static_region.clocks[0] if self._static_region.clocks else 'clk'
+
+        # Detect reset from RTL via pyslang — if not present in RTL, use None
+        # Config defaults (rst_n) apply to RMs; don't force them onto the static wrapper
+        reset_result = _detect_reset_from_rtl(static_sources, static_design, clock_name=static_clock)
+        if reset_result is not None:
+            static_reset, static_reset_active_low = reset_result
+        else:
+            static_reset = None
+            static_reset_active_low = True
 
         self._builder.set_static_region(
             design_name=static_design,
             sources=static_sources,
             ports=static_ports,
             clock_name=static_clock,
+            reset_name=static_reset,
+            reset_active_low=static_reset_active_low,
         )
 
         # Register partitions
@@ -811,6 +825,135 @@ class PRSystem:
             f"Simulation started: {1 + len(initial_rms)} processes "
             f"({len(initial_rms)} partitions)"
         )
+        return self._sim_process
+
+    def simulate_cocotb(
+        self,
+        test_module: str,
+        test_dir: str = None,
+        extra_env: Dict[str, str] = None,
+        hwh_location_dir: str = None,
+        waves: bool = False,
+        initial_rms: Dict[str, str] = None,
+    ):
+        """
+        Run the PR simulation with cocotb hosting the static region.
+
+        cocotb drives the static region via VPI while RM binaries run
+        as separate processes communicating via shared memory.
+
+        Parameters
+        ----------
+        test_module : str
+            Python module name containing cocotb tests.
+        test_dir : str, optional
+            Directory containing the test module.
+        extra_env : dict, optional
+            Additional environment variables for the cocotb test.
+        hwh_location_dir : str, optional
+            Directory containing HWH file (for cocotbpynq overlay).
+        waves : bool
+            Enable waveform dumping.
+        initial_rms : dict, optional
+            Mapping of partition name to initial RM name.
+        """
+        if not self._built:
+            self.build(cocotb_mode=True)
+
+        from .integration.cocotb_runner import PRCocotbRunner
+        runner = PRCocotbRunner(
+            pr_system=self,
+            test_module=test_module,
+            test_dir=test_dir,
+            extra_env=extra_env,
+            hwh_location_dir=hwh_location_dir,
+            waves=waves,
+        )
+        runner.run()
+
+    def _start_rm_processes_only(
+        self,
+        initial_rms: Dict[str, str] = None,
+    ) -> SimulationProcessManager:
+        """
+        Create SHM and start only RM processes (no static binary).
+
+        Used in cocotb mode where cocotb hosts the static region.
+        The static region runs inside cocotb's Verilator process,
+        but RM binaries still run as separate processes.
+
+        Returns
+        -------
+        SimulationProcessManager
+            Manager for the RM processes (no static process).
+        """
+        if initial_rms is None:
+            initial_rms = {}
+        for part_name, partition in self.partitions.items():
+            if part_name not in initial_rms and partition.initial_rm_name:
+                initial_rms[part_name] = partition.initial_rm_name
+
+        # Build partition configs
+        partition_configs = []
+        for part_name, partition in self.partitions.items():
+            part_idx = getattr(partition, '_partition_index', 0)
+            num_to_rm = 0
+            num_from_rm = 0
+            if self._builder:
+                for pi in self._builder._partitions:
+                    if pi.name == part_name:
+                        num_to_rm = sum((p.get('width', 32) + 63) // 64 for p in pi.to_rm_ports)
+                        num_from_rm = sum((p.get('width', 32) + 63) // 64 for p in pi.from_rm_ports)
+                        break
+            partition_configs.append({
+                'name': part_name,
+                'index': part_idx,
+                'num_to_rm': num_to_rm,
+                'num_from_rm': num_from_rm,
+            })
+
+        # Create process manager — create SHM but don't start static binary
+        self._sim_process = SimulationProcessManager(build_dir=self.build_dir)
+
+        shm_dir = self._sim_process.shm_dir
+        shm_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create mailbox (cocotb barrier C++ will mmap this)
+        from .shm_interface import SharedMemoryInterface, MAILBOX_SIZE
+        self._sim_process._shm = SharedMemoryInterface(
+            shm_path=str(shm_dir / 'cmd_mailbox.shm'),
+            create=True,
+        )
+
+        # Create barrier (num_processes = 1 cocotb static + N RMs)
+        num_processes = 1 + len(partition_configs)
+        from .barrier import CycleBarrier
+        self._sim_process._barrier = CycleBarrier(
+            uri=str(shm_dir / 'barrier.shm'),
+            create=True,
+            num_processes=num_processes,
+        )
+
+        # Store partition infos and create channels
+        for pc in partition_configs:
+            self._sim_process._partition_infos[pc['name']] = pc
+            self._sim_process._create_partition_channel(
+                pc['name'], pc['index'],
+                pc['num_to_rm'], pc['num_from_rm'],
+            )
+
+        # Start RM processes
+        for part_name, rm_name in initial_rms.items():
+            rm_binary = self._rm_binary_map.get(rm_name)
+            if rm_binary is None:
+                raise RuntimeError(f"No binary found for RM '{rm_name}'")
+            pc = self._sim_process._partition_infos[part_name]
+            self._sim_process._start_rm_process(
+                part_name, rm_name, rm_binary, pc['index'],
+            )
+
+        self._sim_process._running = True
+        self._running = True
         return self._sim_process
 
     def reconfigure(

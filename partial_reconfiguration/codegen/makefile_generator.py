@@ -52,6 +52,7 @@ class MakefileGenerator:
         trace_type: str = 'vcd',
         extra_cflags: str = '',
         extra_ldflags: str = '',
+        rm_only: bool = False,
     ) -> Path:
         """Generate the Makefile for multi-binary architecture.
 
@@ -74,6 +75,9 @@ class MakefileGenerator:
             Additional compiler flags.
         extra_ldflags : str
             Additional linker flags.
+        rm_only : bool
+            When True, only build RM binaries (skip static binary).
+            Used in cocotb mode where cocotb hosts the static region.
 
         Returns
         -------
@@ -126,7 +130,10 @@ class MakefileGenerator:
             verilator_common += " --trace" + ("-fst" if trace_type == 'fst' else "")
 
         # Phony targets
-        all_binaries = ["$(STATIC_BINARY)"] + rm_binary_vars
+        if rm_only:
+            all_binaries = rm_binary_vars
+        else:
+            all_binaries = ["$(STATIC_BINARY)"] + rm_binary_vars
         lines.append(f".PHONY: all clean")
         lines.append("")
 
@@ -135,7 +142,7 @@ class MakefileGenerator:
         lines.append("# ═══ Verilator library archives ═══")
         lines.append("")
 
-        # Static module lib
+        # Static module lib (needed even in rm_only mode for signal_access.h headers)
         static_obj_dir = f"$(BUILD_DIR)/{static_module.obj_dir_prefix}obj_dir"
         static_lib = f"{static_obj_dir}/V{static_module.top_module}__ALL.a"
         sources_str = " ".join(static_module.sources)
@@ -144,12 +151,13 @@ class MakefileGenerator:
         if vflags:
             vflags = " " + vflags
 
-        lines.append(f"# Static region: {static_module.name}")
-        lines.append(f"{static_lib}: {sources_str}")
-        lines.append(f"\t@mkdir -p {static_obj_dir}")
-        lines.append(f"\t$(VERILATOR) {verilator_common} {static_obj_dir} --top-module {static_module.top_module} --public-flat-rw -Wno-WIDTHTRUNC{vflags} {include_str} {sources_str}")
-        lines.append(f"\t$(MAKE) -C {static_obj_dir} -f V{static_module.top_module}.mk")
-        lines.append("")
+        if not rm_only:
+            lines.append(f"# Static region: {static_module.name}")
+            lines.append(f"{static_lib}: {sources_str}")
+            lines.append(f"\t@mkdir -p {static_obj_dir}")
+            lines.append(f"\t$(VERILATOR) {verilator_common} {static_obj_dir} --top-module {static_module.top_module} --public-flat-rw -Wno-WIDTHTRUNC{vflags} {include_str} {sources_str}")
+            lines.append(f"\t$(MAKE) -C {static_obj_dir} -f V{static_module.top_module}.mk")
+            lines.append("")
 
         # RM module libs
         rm_libs = {}  # rm.name -> lib_path
@@ -199,40 +207,42 @@ class MakefileGenerator:
 
         # ── Static binary DPI objects ─────────────────────────────────
 
-        lines.append("# ═══ Static binary C++ objects ═══")
-        lines.append("")
-
         static_obj_dir_include = f"-I{static_obj_dir}"
-        static_dpi_objs = []
 
-        # Static driver (depends on static lib for generated headers)
-        driver_obj = f"$(DPI_DIR)/static_driver.o"
-        static_dpi_objs.append(driver_obj)
-        lines.append(f"{driver_obj}: {static_driver_cpp} {static_lib}")
-        lines.append(f"\t$(CXX) $(CXXFLAGS) {static_obj_dir_include} -c -o $@ $<")
-        lines.append("")
+        if not rm_only:
+            lines.append("# ═══ Static binary C++ objects ═══")
+            lines.append("")
 
-        # Static-side DPI partition files (depend on static lib for headers)
-        for cpp_file in static_dpi_cpp_files:
-            cpp_path = Path(cpp_file)
-            obj_name = cpp_path.stem + ".o"
-            obj_path = f"$(DPI_DIR)/{obj_name}"
-            static_dpi_objs.append(obj_path)
+            static_dpi_objs = []
 
-            lines.append(f"{obj_path}: {cpp_file} {static_lib}")
+            # Static driver (depends on static lib for generated headers)
+            driver_obj = f"$(DPI_DIR)/static_driver.o"
+            static_dpi_objs.append(driver_obj)
+            lines.append(f"{driver_obj}: {static_driver_cpp} {static_lib}")
             lines.append(f"\t$(CXX) $(CXXFLAGS) {static_obj_dir_include} -c -o $@ $<")
             lines.append("")
 
-        # ── Static binary link ────────────────────────────────────────
+            # Static-side DPI partition files (depend on static lib for headers)
+            for cpp_file in static_dpi_cpp_files:
+                cpp_path = Path(cpp_file)
+                obj_name = cpp_path.stem + ".o"
+                obj_path = f"$(DPI_DIR)/{obj_name}"
+                static_dpi_objs.append(obj_path)
 
-        lines.append("# ═══ Static binary ═══")
-        lines.append("")
+                lines.append(f"{obj_path}: {cpp_file} {static_lib}")
+                lines.append(f"\t$(CXX) $(CXXFLAGS) {static_obj_dir_include} -c -o $@ $<")
+                lines.append("")
 
-        static_all_objs = static_dpi_objs + support_objs
-        objs_str = " ".join(static_all_objs)
-        lines.append(f"$(STATIC_BINARY): {static_lib} {objs_str}")
-        lines.append(f"\t$(CXX) $(CXXFLAGS) -o $@ {objs_str} {static_lib} $(LDFLAGS)")
-        lines.append("")
+            # ── Static binary link ────────────────────────────────────────
+
+            lines.append("# ═══ Static binary ═══")
+            lines.append("")
+
+            static_all_objs = static_dpi_objs + support_objs
+            objs_str = " ".join(static_all_objs)
+            lines.append(f"$(STATIC_BINARY): {static_lib} {objs_str}")
+            lines.append(f"\t$(CXX) $(CXXFLAGS) -o $@ {objs_str} {static_lib} $(LDFLAGS)")
+            lines.append("")
 
         # ── Per-RM binary objects and link ────────────────────────────
 
@@ -279,9 +289,10 @@ class MakefileGenerator:
         lines.append("")
 
         lines.append("clean:")
-        lines.append(f"\trm -rf $(STATIC_BINARY) $(DPI_DIR)/*.o")
+        if not rm_only:
+            lines.append(f"\trm -rf $(STATIC_BINARY) $(DPI_DIR)/*.o")
+            lines.append(f"\trm -rf $(BUILD_DIR)/{static_module.obj_dir_prefix}obj_dir")
         lines.append(f"\trm -rf $(BUILD_DIR)/rm")
-        lines.append(f"\trm -rf $(BUILD_DIR)/{static_module.obj_dir_prefix}obj_dir")
         for rm in rm_binaries:
             lines.append(f"\trm -rf $(BUILD_DIR)/{rm.module.obj_dir_prefix}obj_dir")
         lines.append("")

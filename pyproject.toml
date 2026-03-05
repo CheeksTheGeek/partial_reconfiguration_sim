@@ -9,6 +9,8 @@ dependencies = [
     "numpy",
     "pyyaml",
     "pyslang-dev>=10.0.0.dev20260218",
+    "cocotb>=2.0.1",
+    "cocotbpynq",
 ]
 
 [project.optional-dependencies]
@@ -21,7 +23,7 @@ requires = ["setuptools>=42", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["partial_reconfiguration", "partial_reconfiguration.codegen"]
+packages = ["partial_reconfiguration", "partial_reconfiguration.codegen", "partial_reconfiguration.integration"]
 
 [tool.setuptools.package-data]
 "*" = ["*.sv", "*.v", "*.vh", "*.svh"]
